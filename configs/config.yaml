@@ -1,0 +1,112 @@
+# ============================================================
+# Brain Tumor Segmentation — Configuration
+# ============================================================
+
+seed: 42
+device: "auto"  # auto | cpu | cuda
+
+# ----------------------------------------------------------
+# Dataset
+# ----------------------------------------------------------
+dataset:
+  source: "kaggle"          # kaggle | local | synthetic
+  kaggle_id: "pkdarabi/brain-tumor-image-dataset-semantic-segmentation"
+  local_path: null             # path to local root if source=local
+  image_size: [256, 256]       # [H, W] all images resized to this
+  num_classes: 1               # 1 = binary segmentation
+  in_channels: 3
+  train_ratio: 0.70
+  val_ratio:   0.15
+  test_ratio:  0.15
+  cache_pairs: true            # cache (img_path, mask_path) pairs to CSV
+
+# ----------------------------------------------------------
+# Preprocessing
+# ----------------------------------------------------------
+preprocessing:
+  normalization: "per_image"   # z_score | min_max | per_image
+  binarize_mask: true          # threshold mask to {0,1}
+  mask_threshold: 0.5
+
+# ----------------------------------------------------------
+# Augmentation  (train only)
+# ----------------------------------------------------------
+augmentation:
+  enabled: true
+  horizontal_flip: 0.5
+  vertical_flip:   0.3
+  rotate_limit:    15
+  brightness_limit: 0.15
+  contrast_limit:   0.15
+  noise_var_limit: [5.0, 20.0]
+
+# ----------------------------------------------------------
+# U-Net baseline
+# ----------------------------------------------------------
+unet:
+  depth: 4
+  init_filters: 32
+  dropout: 0.2
+  activation: "relu"
+  norm: "batch"
+
+# ----------------------------------------------------------
+# Training — baseline
+# ----------------------------------------------------------
+training:
+  epochs: 30
+  batch_size: 8
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  loss: "bce_dice"             # bce_dice | focal_dice
+  dice_weight: 0.5
+  bce_weight:  0.5
+  early_stopping_patience: 10
+  grad_clip: 1.0
+  num_workers: 2
+
+# ----------------------------------------------------------
+# RL
+# ----------------------------------------------------------
+rl:
+  mode: "refinement"           # refinement | selector
+  episodes: 300
+  max_steps_per_episode: 8
+  gamma: 0.99
+  lr: 1.0e-4
+  epsilon_start: 1.0
+  epsilon_end:   0.05
+  epsilon_decay: 200           # episodes for epsilon to decay
+  replay_buffer_size: 5000
+  batch_size: 32
+  target_update_freq: 20       # episodes between target net updates
+  num_actions: 8
+  # State features
+  feature_dim: 64
+  hidden_dim: 128
+  # Reward shaping
+  reward_dice_weight:     1.0
+  reward_iou_weight:      0.5
+  reward_fragment_penalty: 0.3
+  reward_step_penalty:    0.02
+  reward_terminal_weight: 2.0
+
+# ----------------------------------------------------------
+# Evaluation
+# ----------------------------------------------------------
+evaluation:
+  hausdorff: true
+  save_predictions: true
+  num_qualitative: 8
+
+# ----------------------------------------------------------
+# Output
+# ----------------------------------------------------------
+output:
+  root: "outputs"
+  checkpoint_dir: "outputs/checkpoints"
+  log_dir:        "outputs/logs"
+  metrics_dir:    "outputs/metrics"
+  figures_dir:    "outputs/figures"
+  predictions_dir: "outputs/predictions"
+  reports_dir:    "outputs/reports"
