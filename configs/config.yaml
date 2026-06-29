@@ -89,7 +89,8 @@ rl:
   reward_iou_weight:      0.5
   reward_fragment_penalty: 0.3
   reward_step_penalty:    0.02
-  reward_terminal_weight: 2.0
+  # Checkpoint selection during training uses val set metrics (not test).
+  eval_on_full_val: true
 
 # ----------------------------------------------------------
 # Evaluation

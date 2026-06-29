@@ -1,3 +1,3 @@
-from .trainer import BaselineTrainer, build_optimizer_scheduler
+from .rl_trainer import ROIFinderTrainer, ROIRefinerTrainer
 
-__all__ = ["BaselineTrainer", "build_optimizer_scheduler"]
+__all__ = ["ROIFinderTrainer", "ROIRefinerTrainer"]
