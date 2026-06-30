@@ -76,7 +76,7 @@ rl:
   lr: 1.0e-4
   epsilon_start: 1.0
   epsilon_end:   0.05
-  epsilon_decay: 200           # episodes for epsilon to decay
+  epsilon_decay: 50           # episodes for epsilon to decay
   replay_buffer_size: 5000
   batch_size: 32
   target_update_freq: 20       # episodes between target net updates

@@ -130,7 +130,7 @@ class ROIFinderEnv:
             self.img_size = int(img_size_cfg)
 
         self.step_size   = max(8, int(self.img_size * 0.06))
-        self.max_steps   = rl.get("roi_max_steps", 20)
+        self.max_steps   = rl.get("roi_max_steps", 100)
         self.step_pen    = rl.get("roi_step_penalty", 0.01)
         self.w_terminal  = rl.get("roi_terminal_weight", 3.0)
 
@@ -141,6 +141,7 @@ class ROIFinderEnv:
         self.box       : list = [0, 0, self.img_size, self.img_size]
         self.prev_iou  : float = 0.0
         self.step_count: int   = 0
+        
 
     # ── Reset ─────────────────────────────────────────────────────────────────
 
@@ -176,6 +177,30 @@ class ROIFinderEnv:
         self.box = [m, m, self.img_size - m, self.img_size - m]
         self.prev_iou   = self._iou(self.box, self.gt_box)
         self.step_count = 0
+        
+        x1, y1, x2, y2 = self.box
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        gx1, gy1, gx2, gy2 = self.gt_box
+        gcx = (gx1 + gx2) / 2
+        gcy = (gy1 + gy2) / 2
+
+        # 1. Errore Centroidi (normalizzato per dimensione immagine)
+        dist_x = abs(cx - gcx) / self.img_size
+        dist_y = abs(cy - gcy) / self.img_size
+        centroid_err = (dist_x + dist_y) / 2
+        
+        # 2. Errore Dimensioni (normalizzato per dimensioni GT)
+        bw = max(x2 - x1, 1)
+        bh = max(y2 - y1, 1)
+        gbw = max(gx2 - gx1, 1)
+        gbh = max(gy2 - gy1, 1)
+        
+        size_err = (abs(bw - gbw) / gbw + abs(bh - gbh) / gbh) / 2
+        
+        # Combinazione degli errori (0 = perfetto, >0 = errore)
+        # Puoi dare pesi diversi se necessario
+        self.prev_total_err = (0.5 * centroid_err + 0.5 * size_err)
 
         return self._get_state()
 

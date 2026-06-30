@@ -31,6 +31,17 @@ NOVITÀ:
   - Validazione: ad ogni eval_every si valuta su TUTTO il val set (IoU/Dice).
   - Test: solo alla fine, sul test set, per metriche e visualizzazioni finali.
   - Checkpoint parziali salvati sul val set durante il training.
+
+NOVITÀ (analisi detection ROI):
+  - Dopo la valutazione finale del ROI Finder sul test set, ogni campione
+    viene classificato come "trovato" (positivo) se IoU > 0.5, altrimenti
+    "non trovato" (negativo). La GT è "sempre presente" (il tumore esiste
+    sempre nel dataset), quindi la confusion matrix è costruita confrontando
+    "trovato" vs "non trovato" rispetto alla soglia IoU=0.5 — utile come
+    proxy della qualità di detection del ROI Finder.
+  - Vengono salvati: confusion matrix, accuracy/precision/recall/F1/specificity,
+    grafici (istogramma IoU, curva ordinata, barre metriche) e una griglia
+    riassuntiva con le best 10 e worst 10 predizioni per IoU.
 """
 import sys
 import os
@@ -629,6 +640,310 @@ def evaluate_dual_rl(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Analisi "ROI Detection" (IoU > soglia → trovato / non trovato)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def analyze_roi_detection(
+    roi_test: dict,
+    test_loader,
+    finder_env: ROIFinderEnv,
+    cfg: dict,
+    iou_threshold: float = 0.5,
+    tag: str = "roi_detection",
+) -> dict:
+    """
+    Analizza i risultati del ROI Finder sul test set come un problema di
+    classificazione binaria "trovato / non trovato": un campione è
+    considerato "trovato" (predizione positiva) se il suo IoU con la GT
+    box supera `iou_threshold` (default 0.5), altrimenti "non trovato".
+
+    Dato che nel dataset il tumore (GT) è sempre presente, la classe
+    "positiva reale" coincide per costruzione con tutti i campioni
+    (la GT è sempre un box valido): la confusion matrix qui confronta
+    quindi la predizione di detection (IoU > soglia) con l'esito atteso
+    (sempre "presente"), utile per misurare quanto spesso l'agente
+    individua correttamente la ROI con qualità sufficiente.
+
+    Salva:
+      - confusion_matrix.png       (matrice di confusione 2x2)
+      - detection_metrics.png      (barre: accuracy/precision/recall/...)
+      - iou_histogram.png          (istogramma distribuzione IoU)
+      - iou_sorted_curve.png       (curva IoU ordinata con soglia)
+      - best_worst_grid.png        (griglia best-10 / worst-10 per IoU)
+      - detection_metrics.csv      (metriche numeriche)
+      - detection_per_sample.csv   (dettaglio per campione)
+
+    Returns: dict con tutte le metriche calcolate.
+    """
+    print(f"\n[pipeline] Analisi ROI Detection (soglia IoU = {iou_threshold:.2f})...")
+
+    out_dir = os.path.join(cfg["output"]["predictions_dir"], tag)
+    metrics_dir = cfg["output"]["metrics_dir"]
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(metrics_dir, exist_ok=True)
+
+    per_sample = roi_test["per_sample"]
+    n_samples = len(per_sample)
+    if n_samples == 0:
+        print("  Nessun campione disponibile, analisi saltata.")
+        return {}
+
+    ious = np.array([s["iou"] for s in per_sample], dtype=np.float32)
+
+    # ── Costruzione "predizione" e "ground truth" per la detection ───────────
+    # Predizione: 1 se IoU > soglia (ROI trovata con qualità sufficiente)
+    # Ground truth: 1 per costruzione (il tumore/ROI esiste sempre nel dataset)
+    y_pred = (ious > iou_threshold).astype(int)
+    y_true = np.ones_like(y_pred)  # la GT è sempre presente
+
+    tp = int(np.sum((y_pred == 1) & (y_true == 1)))
+    fn = int(np.sum((y_pred == 0) & (y_true == 1)))
+    fp = int(np.sum((y_pred == 1) & (y_true == 0)))  # strutturalmente 0
+    tn = int(np.sum((y_pred == 0) & (y_true == 0)))  # strutturalmente 0
+
+    eps = 1e-6
+    accuracy    = (tp + tn) / (tp + tn + fp + fn + eps)
+    precision   = tp / (tp + fp + eps)
+    recall      = tp / (tp + fn + eps)          # = sensitivity = % "trovati"
+    specificity = tn / (tn + fp + eps)
+    f1          = 2 * precision * recall / (precision + recall + eps)
+
+    detection_metrics = {
+        "iou_threshold": iou_threshold,
+        "n_samples":     n_samples,
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "accuracy":    float(accuracy),
+        "precision":   float(precision),
+        "recall":      float(recall),
+        "specificity": float(specificity),
+        "f1_score":    float(f1),
+        "mean_iou":    float(np.mean(ious)),
+        "std_iou":     float(np.std(ious)),
+        "median_iou":  float(np.median(ious)),
+        "found_rate":  float(np.mean(y_pred)),  # frazione campioni con IoU > soglia
+    }
+
+    print(f"  Campioni 'trovati' (IoU>{iou_threshold:.2f}): {tp}/{n_samples} "
+          f"({detection_metrics['found_rate']*100:.1f}%)")
+    print(f"  Accuracy   : {accuracy:.4f}")
+    print(f"  Precision  : {precision:.4f}")
+    print(f"  Recall     : {recall:.4f}")
+    print(f"  Specificity: {specificity:.4f}")
+    print(f"  F1-score   : {f1:.4f}")
+
+    # ── CSV metriche aggregate ────────────────────────────────────────────────
+    pd.DataFrame([detection_metrics]).to_csv(
+        os.path.join(metrics_dir, "detection_metrics.csv"), index=False
+    )
+
+    # ── CSV dettaglio per campione ────────────────────────────────────────────
+    per_sample_df = pd.DataFrame([{
+        "sample_idx": s["sample_idx"],
+        "iou":        s["iou"],
+        "found":      bool(s["iou"] > iou_threshold),
+        "gt_box":     s["gt_box"],
+        "pred_box":   s["pred_box"],
+    } for s in per_sample])
+    per_sample_df.to_csv(
+        os.path.join(metrics_dir, "detection_per_sample.csv"), index=False
+    )
+
+    # ── Grafico 1: Confusion Matrix ───────────────────────────────────────────
+    cm = np.array([[tp, fn], [fp, tn]])  # righe: reale (presente/assente) - qui assente è strutturale
+    fig, ax = plt.subplots(figsize=(5.5, 5), dpi=130)
+    fig.patch.set_facecolor("#0F172A")
+    ax.set_facecolor("#0F172A")
+    im = ax.imshow(cm, cmap="Blues", vmin=0)
+    labels = ["Trovato\n(IoU>soglia)", "Non trovato\n(IoU≤soglia)"]
+    ax.set_xticks([0, 1]); ax.set_xticklabels(labels, color="white", fontsize=9)
+    ax.set_yticks([0, 1]); ax.set_yticklabels(labels, color="white", fontsize=9)
+    ax.set_xlabel("Predetto (Agente)", color="white", fontsize=10)
+    ax.set_ylabel("Atteso (GT sempre presente)", color="white", fontsize=10)
+    ax.set_title(f"Confusion Matrix — ROI Detection (soglia IoU={iou_threshold:.2f})",
+                color="white", fontsize=11, fontweight="bold", pad=12)
+    for i in range(2):
+        for j in range(2):
+            val = cm[i, j]
+            color_txt = "white" if val < cm.max() / 2 else "black"
+            ax.text(j, i, str(val), ha="center", va="center",
+                    color=color_txt, fontsize=16, fontweight="bold")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    cm_path = os.path.join(out_dir, "confusion_matrix.png")
+    fig.savefig(cm_path, dpi=130, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+    # ── Grafico 2: barre metriche (accuracy/precision/recall/specificity/f1) ─
+    fig, ax = plt.subplots(figsize=(7, 4.5), dpi=130)
+    fig.patch.set_facecolor("#0F172A")
+    ax.set_facecolor("#0F172A")
+    names = ["Accuracy", "Precision", "Recall", "Specificity", "F1-score"]
+    vals  = [accuracy, precision, recall, specificity, f1]
+    colors_bar = ["#38bdf8", "#f59e0b", "#22c55e", "#a78bfa", "#f43f5e"]
+    bars = ax.bar(names, vals, color=colors_bar, edgecolor="white", linewidth=0.6)
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("Score", color="white", fontsize=10)
+    ax.set_title(f"Metriche di Detection ROI (soglia IoU={iou_threshold:.2f}, n={n_samples})",
+                color="white", fontsize=11, fontweight="bold")
+    ax.tick_params(colors="white", labelsize=9)
+    for sp in ax.spines.values():
+        sp.set_edgecolor("#334155")
+    for b, v in zip(bars, vals):
+        ax.text(b.get_x() + b.get_width() / 2, v + 0.02, f"{v:.3f}",
+                ha="center", color="white", fontsize=9, fontweight="bold")
+    fig.tight_layout()
+    metrics_path = os.path.join(out_dir, "detection_metrics.png")
+    fig.savefig(metrics_path, dpi=130, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+    # ── Grafico 3: istogramma distribuzione IoU ───────────────────────────────
+    fig, ax = plt.subplots(figsize=(7, 4.5), dpi=130)
+    fig.patch.set_facecolor("#0F172A")
+    ax.set_facecolor("#0F172A")
+    n_bins = min(30, max(10, n_samples // 3))
+    counts, bins, patches = ax.hist(ious, bins=n_bins, color="#38bdf8",
+                                    edgecolor="#0F172A", alpha=0.9)
+    for patch, left_edge in zip(patches, bins[:-1]):
+        patch.set_facecolor("#22c55e" if left_edge > iou_threshold else "#f43f5e")
+    ax.axvline(iou_threshold, color="yellow", linestyle="--", linewidth=2,
+              label=f"Soglia = {iou_threshold:.2f}")
+    ax.axvline(detection_metrics["mean_iou"], color="white", linestyle=":", linewidth=2,
+              label=f"Media = {detection_metrics['mean_iou']:.3f}")
+    ax.set_xlabel("IoU", color="white", fontsize=10)
+    ax.set_ylabel("Numero campioni", color="white", fontsize=10)
+    ax.set_title("Distribuzione IoU — Test set (ROI Finder)",
+                color="white", fontsize=11, fontweight="bold")
+    ax.tick_params(colors="white", labelsize=9)
+    ax.legend(fontsize=8, labelcolor="white", facecolor="#1e293b", edgecolor="none")
+    for sp in ax.spines.values():
+        sp.set_edgecolor("#334155")
+    fig.tight_layout()
+    hist_path = os.path.join(out_dir, "iou_histogram.png")
+    fig.savefig(hist_path, dpi=130, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+    # ── Grafico 4: curva IoU ordinata (ranking) ───────────────────────────────
+    fig, ax = plt.subplots(figsize=(7, 4.5), dpi=130)
+    fig.patch.set_facecolor("#0F172A")
+    ax.set_facecolor("#0F172A")
+    sorted_iou = np.sort(ious)[::-1]
+    x_axis = np.arange(1, len(sorted_iou) + 1)
+    ax.plot(x_axis, sorted_iou, color="#38bdf8", linewidth=1.8)
+    ax.fill_between(x_axis, sorted_iou, alpha=0.15, color="#38bdf8")
+    ax.axhline(iou_threshold, color="yellow", linestyle="--", linewidth=1.5,
+              label=f"Soglia = {iou_threshold:.2f}")
+    n_above = int(np.sum(sorted_iou > iou_threshold))
+    if n_above > 0:
+        ax.axvline(n_above, color="#22c55e", linestyle=":", linewidth=1.5,
+                  label=f"{n_above} campioni sopra soglia")
+    ax.set_xlabel("Campioni (ordinati per IoU decrescente)", color="white", fontsize=10)
+    ax.set_ylabel("IoU", color="white", fontsize=10)
+    ax.set_title("Curva IoU ordinata — Test set (ROI Finder)",
+                color="white", fontsize=11, fontweight="bold")
+    ax.tick_params(colors="white", labelsize=9)
+    ax.legend(fontsize=8, labelcolor="white", facecolor="#1e293b", edgecolor="none")
+    for sp in ax.spines.values():
+        sp.set_edgecolor("#334155")
+    fig.tight_layout()
+    curve_path = os.path.join(out_dir, "iou_sorted_curve.png")
+    fig.savefig(curve_path, dpi=130, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+    # ── Grafico 5: griglia Best 10 / Worst 10 ─────────────────────────────────
+    best_worst_path = _save_best_worst_grid(
+        per_sample=per_sample,
+        test_loader=test_loader,
+        finder_env=finder_env,
+        out_dir=out_dir,
+        n_each=10,
+    )
+
+    print(f"  Confusion matrix → {cm_path}")
+    print(f"  Metriche barre   → {metrics_path}")
+    print(f"  Istogramma IoU   → {hist_path}")
+    print(f"  Curva IoU        → {curve_path}")
+    print(f"  Best/Worst grid  → {best_worst_path}")
+    print(f"  CSV metriche     → {os.path.join(metrics_dir, 'detection_metrics.csv')}")
+    print(f"  CSV per-campione → {os.path.join(metrics_dir, 'detection_per_sample.csv')}")
+
+    detection_metrics["plots"] = {
+        "confusion_matrix": cm_path,
+        "metrics_bars":     metrics_path,
+        "iou_histogram":    hist_path,
+        "iou_sorted_curve": curve_path,
+        "best_worst_grid":  best_worst_path,
+    }
+    return detection_metrics
+
+
+def _save_best_worst_grid(
+    per_sample: list,
+    test_loader,
+    finder_env: ROIFinderEnv,
+    out_dir: str,
+    n_each: int = 10,
+) -> str:
+    """
+    Ricostruisce le immagini (GT box verde + pred box arancio) per i top-N
+    e i bottom-N campioni per IoU e li dispone in un'unica griglia riassuntiva
+    a due blocchi (Best 10 in alto, Worst 10 in basso).
+
+    Nota: per ricostruire le immagini è necessario re-iterare il data_loader
+    (le immagini grezze non sono salvate in `per_sample`).
+    """
+    # Indicizza tutte le immagini del loader per sample_idx (stesso ordine
+    # usato in evaluate_roi_finder_only, quindi deterministico).
+    images_by_idx = {}
+    idx_counter = 0
+    for batch in test_loader:
+        imgs = batch["image"]
+        for i in range(imgs.size(0)):
+            images_by_idx[idx_counter] = _tensor_to_gray(imgs[i])
+            idx_counter += 1
+
+    sorted_samples = sorted(per_sample, key=lambda s: s["iou"], reverse=True)
+    best_n  = sorted_samples[:n_each]
+    worst_n = sorted_samples[-n_each:][::-1]  # dal peggiore al "meno peggiore"
+
+    cols = n_each
+    fig, axes = plt.subplots(2, cols, figsize=(cols * 2.6, 2 * 2.9), dpi=130)
+    fig.patch.set_facecolor("#0F172A")
+    fig.suptitle(
+        f"ROI Finder — Best {n_each} (sopra) vs Worst {n_each} (sotto) per IoU",
+        color="white", fontsize=13, fontweight="bold",
+    )
+
+    def _render_panel(ax, sample, rank_label, border_color):
+        idx = sample["sample_idx"]
+        img_gray = images_by_idx.get(idx)
+        if img_gray is None:
+            ax.axis("off")
+            return
+        img_rgb = _gray_to_rgb(img_gray)
+        panel = _draw_box(img_rgb, sample["gt_box"], (50, 220, 50), 2, "")
+        panel = _draw_box(panel, sample["pred_box"], (255, 90, 50), 2, "")
+        ax.imshow(panel)
+        ax.set_title(f"{rank_label} #{idx:04d}\nIoU={sample['iou']:.3f}",
+                    color=border_color, fontsize=8, fontweight="bold")
+        ax.axis("off")
+        for spine_pos in ["top", "bottom", "left", "right"]:
+            ax.spines[spine_pos].set_visible(True)
+            ax.spines[spine_pos].set_color(border_color)
+            ax.spines[spine_pos].set_linewidth(2)
+
+    for j, sample in enumerate(best_n):
+        _render_panel(axes[0, j], sample, f"Best #{j+1}", "#22c55e")
+    for j, sample in enumerate(worst_n):
+        _render_panel(axes[1, j], sample, f"Worst #{j+1}", "#f43f5e")
+
+    fig.tight_layout(pad=0.4, rect=[0, 0, 1, 0.94])
+    grid_path = os.path.join(out_dir, "best_worst_grid.png")
+    fig.savefig(grid_path, dpi=130, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return grid_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Report
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -804,6 +1119,19 @@ def main():
             index=False
         )
 
+    # ── 3bis) Analisi ROI Detection (IoU > 0.5 → trovato/non trovato) ────────
+    # Costruisce confusion matrix, accuracy/precision/recall/specificity/F1,
+    # grafici (istogramma, curva ordinata, barre) e griglia best10/worst10.
+    print("\n[pipeline] Step 3bis: Analisi detection ROI (soglia IoU=0.5)...")
+    detection_results = analyze_roi_detection(
+        roi_test=roi_test,
+        test_loader=test_loader,
+        finder_env=finder_env,
+        cfg=cfg,
+        iou_threshold=0.5,
+        tag="roi_detection",
+    )
+
     # ── 4) Setup Agent 2: ROI Refiner ─────────────────────────────────────────
     print("\n[pipeline] Step 4: Inizializzazione Agent 2 (ROI Refiner)...")
     refiner_env   = ROIRefinementEnv(cfg)
@@ -838,7 +1166,7 @@ def main():
         ),
     )
     refiner_trainer.episodes = refine_episodes
-
+    '''
     # ── 5) Training Agent 2 ───────────────────────────────────────────────────
     print("\n[pipeline] Step 5: Training Agent 2 (ROI Refiner)...")
     history_refiner = refiner_trainer.train(eval_every=eval_every_2)
@@ -963,6 +1291,24 @@ def main():
     print(f"  Dual RL Dice μ            : {rl.get('dice', 0):.4f} ± {results['dice_rl_std']:.4f}")
     print(f"  Dual RL Dice mediana      : {results['dice_rl_median']:.4f}")
     print(f"  Miglioramento Dice        : {rl.get('dice', 0) - bl.get('dice', 0):+.4f}")
+    '''
+
+    # ── Fine (con solo Agent 1 attivo) ───────────────────────────────────────
+    print("\n" + "="*60)
+    print(" Pipeline (Agent 1 ROI Finder + analisi detection) completato!")
+    print("="*60)
+    print(f"  Checkpoint Agent 1 → {cfg['output']['checkpoint_dir']}/best_roi_finder_agent.pth")
+    print(f"  ROI test finale    → {roi_preds_dir}/")
+    print(f"  Detection plots    → {os.path.join(cfg['output']['predictions_dir'], 'roi_detection')}/")
+    print(f"  Detection CSV      → {os.path.join(cfg['output']['metrics_dir'], 'detection_metrics.csv')}")
+    print(f"\n  Campioni di test valutati : {roi_test['n_samples']}")
+    print(f"  ROI Finder IoU μ          : {roi_test['mean_iou']:.4f} ± {roi_test['std_iou']:.4f}")
+    if detection_results:
+        print(f"  Accuracy (IoU>0.5)        : {detection_results['accuracy']:.4f}")
+        print(f"  Precision                 : {detection_results['precision']:.4f}")
+        print(f"  Recall                    : {detection_results['recall']:.4f}")
+        print(f"  F1-score                  : {detection_results['f1_score']:.4f}")
+        print(f"  Found rate (IoU>0.5)      : {detection_results['found_rate']*100:.1f}%")
 
 
 if __name__ == "__main__":
