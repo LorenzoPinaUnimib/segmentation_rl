@@ -974,7 +974,7 @@ def load_checkpoint(checkpoint_path: Path, model: nn.Module,
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     
-    start_epoch = checkpoint.get('epoch', 0)
+    start_epoch = checkpoint.get('epoch', 0) + 1
     best_loss = checkpoint.get('best_loss', float('inf'))
     iou_history = checkpoint.get('iou_history', [])
     
