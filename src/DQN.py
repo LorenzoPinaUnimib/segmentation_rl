@@ -26,7 +26,10 @@ class BrainTumorEnv(gymnasium.Env):
 
         # Imposta il conteggio attuale e il numero massimo di passi per episodio
         self.step_count = 0
-        self.max_steps = 500
+        self.max_steps = 200
+        # Variabili per il reward shaping
+        self.prev_dist = None
+        self.prev_iou = None
 
     def reset(self, seed=None):
         super().reset(seed=seed)
@@ -34,8 +37,9 @@ class BrainTumorEnv(gymnasium.Env):
         # Sceglie un'immagine casuale
         self.current_img_idx = random.randint(0, len(self.images) - 1)
 
-        # Definiamo una box iniziale al centro dell'immagine e di dimensione pari al 10% della stessa
-        box_size = 0.1
+        # Definiamo una box iniziale al centro dell'immagine e di dimensione pari al 100% della stessa
+        # TODO: diminuire dimensione box
+        box_size = 1.0
         start_x = 0.5 - (box_size / 2)
         start_y = 0.5 - (box_size / 2)
         
@@ -43,6 +47,9 @@ class BrainTumorEnv(gymnasium.Env):
         
         # Imposta il numero di passi a 0
         self.step_count = 0
+        # Resetta i valori precedenti per il reward shaping
+        self.prev_dist = None
+        self.prev_iou = None
 
         # Restituisce l'immagine e la box
         observation = {
@@ -91,7 +98,10 @@ class BrainTumorEnv(gymnasium.Env):
 
         if self.calculate_iou(self.agent_box, target) > 0.7:
             terminated = True
-            reward += 20
+            if self.calculate_iou(self.agent_box, target) > 0.9:
+                reward += 100
+            else:
+                reward += 40
 
         # Controllo se ho raggiunto il massimo numero di passi
         truncated = False
@@ -126,16 +136,39 @@ class BrainTumorEnv(gymnasium.Env):
         target = self.target_boxes[self.current_img_idx]
         iou = self.calculate_iou(self.agent_box, target)
 
-        # Assegno una reward in base alla IoU
-        reward = iou * 5.0
+        # Definisco reward base per questo passo
+        reward = 0.0
+
+        # Aumento la reward in base all'avvicinamento dell'agente alla dimensione corretta
+        if self.prev_iou is not None:
+            iou_improvement = iou - self.prev_iou
+
+            if iou_improvement > 0:
+                reward += iou_improvement * 100.0
+            else:
+                reward += iou_improvement * 110.0
+        
+        # Salvo la IoU attuale
+        self.prev_iou = iou
 
         # Calcolo il centro delle due box
         center_agent = np.array([self.agent_box[0] + self.agent_box[2]/2, self.agent_box[1] + self.agent_box[3]/2])
         center_target = np.array([target[0] + target[2]/2, target[1] + target[3]/2])
 
-        # Determino la distanza tra i due centri e diminuisco la reward
+        # Determino la distanza tra i due centri
         dist = np.linalg.norm(center_agent - center_target)
-        reward -= dist * 1.0
+
+        # Aumento la reward in base all'avvicinamento delle due box
+        if self.prev_dist is not None:
+            dist_improvement = self.prev_dist - dist
+
+            if (dist_improvement > 0):
+                reward += dist_improvement * 50.0
+            else:
+                reward += dist_improvement * 60.0
+        
+        # Salvo la distanza attuale
+        self.prev_dist = dist
 
         # Penalizzazione per ogni passo aggiuntivo
         reward -= 0.01
@@ -147,7 +180,7 @@ def build_dqn_model():
     img_input = tf.keras.layers.Input(shape=(640, 640, 3), name="image")
 
     # Riduco la dimensione dell'immaigne e normalizzo i pixel
-    x = tf.keras.layers.Resizing(128, 128)(img_input)
+    x = tf.keras.layers.Resizing(224, 224)(img_input)
     x = tf.keras.layers.Rescaling(1./255)(x) 
 
     # Estrazione delle feature dall'immagine ridotta
@@ -156,7 +189,7 @@ def build_dqn_model():
     x = tf.keras.layers.Conv2D(64, 3, activation='relu')(x)
     x = tf.keras.layers.MaxPooling2D()(x)
     x = tf.keras.layers.Conv2D(128, 3, activation='relu')(x)
-    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Flatten()(x)
 
     # Prendo in input la box attuale
     box_input = tf.keras.layers.Input(shape=(4,), name="box")
@@ -182,7 +215,7 @@ class DQNAgent:
 
         # Definisce la dimensione della memoria delle ultime esperienze
         # TODO: testare aumento della memoria
-        self.memory = deque(maxlen=1000) 
+        self.memory = deque(maxlen=500) 
 
         # Quanto conta il futuro rispetto ad adesso
         self.gamma = 0.95
@@ -193,11 +226,16 @@ class DQNAgent:
         # Fattore minimo di esplorazione
         self.epsilon_min = 0.01
 
-        # Diminuzione dopo ogni allenamento
-        self.epsilon_decay = 0.998
+        # Diminuzione dopo ogni allenamento (viene moltiplicato ogni volta)
+        self.epsilon_decay = 0.9975
 
         # Crea la rete neurale
         self.model = build_dqn_model()
+        self.target_model = build_dqn_model()
+        self.update_target_model()
+
+    def update_target_model(self):
+        self.target_model.set_weights(self.model.get_weights())
 
     def act(self, state, training=True):
         # Sceglie se esplorare o meno
@@ -221,7 +259,6 @@ class DQNAgent:
         # Estraggo un minibatch
         minibatch = random.sample(self.memory, batch_size)
 
-
         states_img = np.array([s['image'] for s, a, r, ns, d in minibatch])
         states_box = np.array([s['box'] for s, a, r, ns, d in minibatch])
         next_states_img = np.array([ns['image'] for s, a, r, ns, d in minibatch])
@@ -229,13 +266,16 @@ class DQNAgent:
         rewards = np.array([r for s, a, r, ns, d in minibatch])
         actions = np.array([a for s, a, r, ns, d in minibatch])
         dones = np.array([d for s, a, r, ns, d in minibatch])
+
         targets = self.model.predict([states_img, states_box], verbose=0)
-        next_q_values = self.model.predict([next_states_img, next_states_box], verbose=0)
+        next_q_values = self.target_model.predict([next_states_img, next_states_box], verbose=0)
+
         for i in range(batch_size):
             target = rewards[i]
             if not dones[i]:
                 target = (rewards[i] + self.gamma * np.amax(next_q_values[i]))
             targets[i][actions[i]] = target
+
         self.model.fit([states_img, states_box], targets, epochs=1, verbose=0)
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
@@ -323,15 +363,16 @@ test_images, test_boxes = load_coco_dataset(os.path.join(dataset_path, "test"))
 
 env_train = BrainTumorEnv(train_images, train_boxes)
 env_test = BrainTumorEnv(test_images, test_boxes)
-agent = DQNAgent(action_size=6)
+agent = DQNAgent(action_size=8)
 
 episodes = 2000
 batch_size = 64
+rewards_history = [] # Lista per memorizzare la reward di ogni episodio
 
 for e in range(episodes):
     state, _ = env_train.reset() 
     total_reward = 0
-    for time in range(100):
+    for time in range(env_train.max_steps):
         action = agent.act(state)
         next_state, reward, terminated, truncated, _ = env_train.step(action)
         done = terminated or truncated
@@ -340,9 +381,18 @@ for e in range(episodes):
         total_reward += reward
         if done:
             break
+    
+    rewards_history.append(total_reward) # Salvataggio reward
     agent.replay(batch_size)
+    
     if (e + 1) % 10 == 0:
-        print(f"Episodio: {e+1}/{episodes}, Reward: {total_reward:.2f}, Epsilon: {agent.epsilon:.2f}")
+        # Aggiorno la target network
+        agent.update_target_model()
+
+        # Calcolo la media degli ultimi 10 episodi
+        avg_reward = np.mean(rewards_history[-10:])
+        print(f"Episodio: {e+1}/{episodes}, Reward: {total_reward:.2f}, Media 10 ep: {avg_reward:.2f}, Epsilon: {agent.epsilon:.2f}")
+    
     # if (e + 1) % 200 == 0:
         # visualize_progress(env_train, agent, e + 1)
 
@@ -363,4 +413,17 @@ for e in range(test_episodes):
 
 print(f"Test completato. Success Rate: {(successes/test_episodes)*100:.2f}%")
 
-# TODO: implementare grafico della reward negli episodi
+# Implementazione grafico della reward
+plt.figure(figsize=(10, 5))
+plt.plot(rewards_history, label='Reward per Episodio', color='blue', alpha=0.3)
+# Aggiungo una media mobile per rendere il grafico più leggibile
+if len(rewards_history) >= 10:
+    moving_avg = np.convolve(rewards_history, np.ones(10)/10, mode='valid')
+    plt.plot(range(9, len(rewards_history)), moving_avg, label='Media Mobile (10 ep)', color='red', linewidth=2)
+
+plt.title("Andamento della Reward durante l'addestramento")
+plt.xlabel("Episodio")
+plt.ylabel("Reward Totale")
+plt.legend()
+plt.grid(True)
+plt.show()
