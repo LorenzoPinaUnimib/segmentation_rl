@@ -1,3 +1,9 @@
 /outputs
 **/__pycache__
+/episode_debug
+/ppo_brain_tumor_logs
+/prog/ppo_brain_tumor_logs
+/ppo_gradcam_outputs
 /epoch_predictions
+/src
+/rollout_viz
