@@ -141,6 +141,17 @@ class _BaseTumorDataset(Dataset):
         self.thresh = cfg["preprocessing"].get("mask_threshold", 0.5)
         self.use_brain_mask = cfg["preprocessing"].get("brain_masking", False)
         self.augment = (split == "train")
+        # SPEEDUP: cache in RAM del risultato di white-balance/CLAHE/
+        # normalizzazione (costoso, cv2 su LAB) gia' ridimensionato al target
+        # size. Nel loop RL la stessa immagine viene rivisitata decine di
+        # volte (un episodio per reset, molti reset per epoca): senza cache
+        # questo preprocessing pesante veniva rifatto da zero ogni volta.
+        # Dato che si salva GIA' ridimensionato a image_size, l'occupazione
+        # e' limitata (~0.6MB/immagine a 224x224x3) indipendentemente dalla
+        # risoluzione originale su disco. Disattivabile con
+        # cfg["dataset"]["cache_preprocessed"] = False se la RAM e' scarsa.
+        self.cache_preprocessed = cfg["dataset"].get("cache_preprocessed", True)
+        self._pre_cache = {}
         self._build_transform()
 
     def _build_transform(self):
@@ -156,7 +167,7 @@ class _BaseTumorDataset(Dataset):
             self.use_alb = False
 
     def _load_image(self, path: Path) -> np.ndarray:
-        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE if self.in_channels == 1 else cv2.IMREAD_COLOR)
         if img is None:
             raise FileNotFoundError(f"Cannot read image: {path}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -164,10 +175,12 @@ class _BaseTumorDataset(Dataset):
             img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
         return img
 
-    def _finalize(self, image_raw: np.ndarray, mask_raw: np.ndarray, idx: int) -> Dict[str, torch.Tensor]:
+    def _build_cache_entry(self, image_raw: np.ndarray, mask_raw: np.ndarray):
         """
-        image_raw: immagine come caricata (uint8 o float, non ancora normalizzata)
-        mask_raw: maschera float32 gia' in [0,1] (non ancora binarizzata/thresholded)
+        Esegue UNA VOLTA (per idx) il preprocessing pesante (white-balance,
+        CLAHE, normalizzazione) e ridimensiona subito al target size, cosi'
+        le visite successive alla stessa immagine (molti episodi/epoche RL)
+        leggono solo dalla cache invece di rifare da zero cv2/LAB ogni volta.
         """
         if self.binarize:
             mask_bin = (mask_raw > self.thresh).astype(np.float32)
@@ -181,6 +194,42 @@ class _BaseTumorDataset(Dataset):
         if image.ndim == 2:
             image = image[..., np.newaxis]
             image = np.repeat(image, 3, axis=-1) if self.use_alb else image
+
+        # Ridimensiona subito al target size: la cache resta piccola e
+        # limitata indipendentemente dalla risoluzione originale su disco.
+        h, w = self.image_size
+        image = cv2.resize(image, (w, h), interpolation=cv2.INTER_AREA)
+        if image.ndim == 2:
+            image = image[..., np.newaxis]
+        mask_bin = cv2.resize(mask_bin, (w, h), interpolation=cv2.INTER_NEAREST)
+        if brain_mask is not None:
+            brain_mask = cv2.resize(brain_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        return image, mask_bin, brain_mask, pre["area_ratio"], pre["polarity"]
+
+    def _get_or_build(self, idx: int, loader_fn):
+        """
+        loader_fn: callable() -> (image_raw, mask_raw), invocata SOLO in caso
+        di cache miss (evita anche la rilettura da disco quando gia' in cache).
+        """
+        if self.cache_preprocessed:
+            entry = self._pre_cache.get(idx)
+            if entry is not None:
+                return entry
+        image_raw, mask_raw = loader_fn()
+        entry = self._build_cache_entry(image_raw, mask_raw)
+        if self.cache_preprocessed:
+            self._pre_cache[idx] = entry
+        return entry
+
+    def _finalize(self, entry, idx: int) -> Dict[str, torch.Tensor]:
+        """
+        entry: tupla (image_norm, mask_bin, brain_mask, area_ratio, polarity)
+        gia' pronta (da cache o appena calcolata da _build_cache_entry).
+        Qui si applica SOLO l'augmentation, che deve restare diversa ad ogni
+        chiamata (altrimenti l'agente vedrebbe sempre la stessa vista).
+        """
+        image, mask_bin, brain_mask, area_ratio, polarity = entry
 
         if self.use_alb:
             kwargs = dict(image=image, mask=mask_bin)
@@ -207,8 +256,8 @@ class _BaseTumorDataset(Dataset):
             # sezione 8/9/13 del prompt: metadati per stratified sampling e
             # valutazione per dimensione/polarita', stabili rispetto
             # all'augmentation (calcolati pre-transform in apply_preprocessing).
-            "area_ratio": pre["area_ratio"],
-            "polarity": pre["polarity"],
+            "area_ratio": area_ratio,
+            "polarity": polarity,
         }
         if brain_mask_t is not None:
             if brain_mask_t.ndim == 2:
@@ -240,10 +289,15 @@ class COCOAnnotationDataset(_BaseTumorDataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         img_path, ann_dict = self.pairs[idx]
-        image = self._load_image(img_path)
-        h, w = ann_dict["height"], ann_dict["width"]
-        mask = polygons_to_mask(ann_dict["annotations"], h, w)
-        return self._finalize(image, mask, idx)
+
+        def _loader():
+            image = self._load_image(img_path)
+            h, w = ann_dict["height"], ann_dict["width"]
+            mask = polygons_to_mask(ann_dict["annotations"], h, w)
+            return image, mask
+
+        entry = self._get_or_build(idx, _loader)
+        return self._finalize(entry, idx)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -271,10 +325,15 @@ class BrainTumorDataset(_BaseTumorDataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         img_path, mask_path = self.pairs[idx]
-        image = self._load_image(img_path)
-        mask = self._load_mask(mask_path)
-        mask = mask.astype(np.float32) / 255.0 if mask.max() > 1 else mask.astype(np.float32)
-        return self._finalize(image, mask, idx)
+
+        def _loader():
+            image = self._load_image(img_path)
+            mask = self._load_mask(mask_path)
+            mask = mask.astype(np.float32) / 255.0 if mask.max() > 1 else mask.astype(np.float32)
+            return image, mask
+
+        entry = self._get_or_build(idx, _loader)
+        return self._finalize(entry, idx)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -332,8 +391,8 @@ class SyntheticBrainDataset(_BaseTumorDataset):
         return image, mask
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        image, mask = self._generate_sample(idx)
-        return self._finalize(image, mask, idx)
+        entry = self._get_or_build(idx, lambda: self._generate_sample(idx))
+        return self._finalize(entry, idx)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

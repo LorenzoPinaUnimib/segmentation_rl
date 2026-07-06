@@ -1,56 +1,193 @@
 """
 train.py
 ────────
-Pipeline principale: costruisce dataset/ambienti, allena MaskablePPO con
-tutti i callback (curriculum + GradCAM + checkpoint completi), e alla fine
-lancia la valutazione visiva sul test set.
+Loop custom DQN con "Guided Exploration" (Apprenticeship Learning).
 
-Esempi d'uso:
-    # training completo
-    python train.py --total-timesteps 100000 --dataset-source kaggle
+FIX PRINCIPALE (fedelta' al paper): il backbone visivo (vedi q_network.py,
+classe VisualBackbone) e' congelato ma ora e' un vero ResNet18 pre-addestrato
+su ImageNet, non piu' un proiettore casuale mai addestrato -- vedi q_network.py
+per i dettagli. policy_net e target_net CONDIVIDONO la stessa istanza di
+backbone (stessi Tensor in VRAM, non due copie): e' identico e mai aggiornato
+in nessuno dei due, quindi duplicarlo sprecherebbe memoria senza motivo, e il
+target update / il salvataggio dei checkpoint ora toccano solo il q_net
+(la parte davvero allenata), non piu' l'intero state_dict.
 
-    # solo valutazione visiva di un modello già allenato
-    python train.py --eval-only --model-path ./ppo_brain_tumor_logs/checkpoints/ppo_brain_tumor_500000.zip \
-                     --vecnorm-path ./ppo_brain_tumor_logs/checkpoints/ppo_brain_tumor_500000_vecnormalize.pkl
+ALTRE CORREZIONI (vedi commenti "FIX" nel corpo del file):
+  - Epoca fedele al paper: permutazione SENZA rimpiazzo del training set ad
+    ogni epoca (prima si campionava CON rimpiazzo in env.reset()).
+  - Schedule di epsilon corretto: 1.0 esatto alla prima epoca, lineare fino
+    a 0.1 alla quinta (prima la prima epoca partiva da 0.82, non da 1.0).
 
-    # guardare l'agente lavorare dal vivo su un campione del test set (richiede display)
-    python train.py --watch-idx 3 --model-path ... --vecnorm-path ...
+DIFFERENZE NOTE (segnalate, non corrette qui perche' non sono bug ma
+adattamenti legittimi al dominio -- vedi anche il docstring di
+environment.py per il dettaglio):
+  - Procedura di test del paper (sez. 4.3, IoR mark + riavvio della ricerca
+    negli angoli) non implementata: ha senso per Pascal VOC multi-istanza,
+    meno per questo dominio single-tumor-per-immagine.
+  - Dominio: MRI single-class invece di Pascal VOC multi-classe/multi-oggetto
+    -- stessa metodologia applicata a un problema diverso, non "lo stesso
+    esperimento" del paper.
 
-    # NUOVO: Simulazione manuale interattiva dell'ambiente (Discreto / PPO)
-    python train.py --simulate --dataset-source synthetic
-
-    # NUOVO: Simulazione manuale interattiva dell'ambiente (Continuo / SAC)
-    python train.py --simulate --continuous --dataset-source synthetic
+OTTIMIZZAZIONI MEMORIA (vedi commenti "MEMFIX"/"FIX embedding cache"):
+  - Il vecchio ReplayBuffer teneva in RAM un dict Python + array numpy float32
+    per OGNI transizione, sia per lo stato che per il next-state (praticamente
+    duplicato). Con region 224x224x3 float32 (~0.57MB) e 50_000 transizioni,
+    questo arrivava a decine di GB (da qui i 20GB/epoca osservati).
+  - Poi il buffer e' passato ad array numpy pre-allocati con region
+    quantizzate a uint8 (4x in meno rispetto a float32) e senza duplicare il
+    next-state (stesso trucco usato da Stable-Baselines3 con
+    optimize_memory_usage / dal Nature DQN).
+  - ORA (dato che il backbone visivo e' congelato per sempre) il buffer non
+    salva piu' i pixel grezzi ma l'EMBEDDING visivo gia' calcolato (512
+    float32 = 2KB, contro i ~150KB di una region 224x224x3 uint8: circa 75x
+    meno RAM per transizione). L'embedding viene calcolato una sola volta per
+    step (in policy_net.encode()) e riusato sia per la scelta dell'azione sia
+    per il push nel buffer, invece di essere ricalcolato ad ogni singolo
+    sample durante l'update (prima: fino a 2*BATCH_SIZE forward del backbone
+    ad ogni update, uno per lo stato corrente e uno per il next-state di ogni
+    elemento del batch). Il flag "done" azzera comunque il bootstrap quando
+    il next-state non e' valido (fine episodio), quindi la correttezza
+    matematica e' preservata esattamente come prima.
+  - Risultato: con capacita' 20_000 il buffer passa da qualche GB a poche
+    decine di MB: si puo' aumentare tranquillamente --replay-size se serve
+    piu' diversita' di esperienza, senza preoccupazioni di RAM.
 """
 import argparse
 import os
+import random
+import gc
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
+from tqdm import tqdm
+from utils import compute_iou
 
-from stable_baselines3 import SAC
-from stable_baselines3.common.callbacks import (
-    CallbackList,
-    EvalCallback,
-    StopTrainingOnNoModelImprovement,
-)
-from stable_baselines3.common.env_checker import check_env
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor, VecNormalize
-from sb3_contrib import MaskablePPO
-from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
-from sb3_contrib.common.wrappers import ActionMasker
-
-from callbacks import (
-    AdaptiveCurriculumCallback,
-    ModelCheckpointCallback,
-    StopCurriculumCallback,
-    VisionMetricsCallback,
-)
-from config import MAX_STEPS_PER_EPISODE
 from dataset import get_datasets
-from environment import BrainTumorRL_Env
-from localizer import load_localizer, make_localizer_fn, train_localizer
-from utils import linear_schedule, mask_fn
-from visual_evaluator import VisualEvaluator
+from environment import ActiveLocalizationEnv
+from q_network import ActiveLocalizationQNet, VisualBackbone
+from config import N_ACTIONS
 
+# Hyperparametri DQN
+BATCH_SIZE = 32
+GAMMA = 0.90
+LR = 1e-5
+REPLAY_SIZE = 20_000   # con il buffer basato su embedding questo e' ormai
+                       # pochissimi MB (vedi ReplayBuffer.estimated_bytes()):
+                       # si puo' alzare molto senza preoccupazioni di RAM.
+TARGET_UPDATE = 1000
+UPDATE_FREQ = 4  # aggiorna la rete ogni 4 step totali, non ad ogni singolo step
+
+
+class ReplayBuffer:
+    """
+    Buffer a capacita' fissa, interamente pre-allocato (nessun overhead di
+    oggetti Python per transizione).
+
+    FIX (embedding cache): dato che il backbone visivo e' congelato per
+    sempre, non ha senso salvare i pixel grezzi della region e ricalcolare il
+    backbone ad ogni sample: si salva direttamente l'embedding visivo
+    (512-dim float32) gia' calcolato al momento della raccolta. Questo taglia
+    la RAM per transizione di circa 75x (2KB contro ~150KB di una region
+    224x224x3 uint8) ed elimina la ricomputazione ridondante del backbone
+    durante il training (prima: fino a 2*BATCH_SIZE forward del backbone per
+    ogni update, uno per stato e uno per next-state di ogni elemento del
+    batch; ora: zero, perche' policy_net/target_net ricevono direttamente
+    l'embedding nel percorso "dim==2" del forward -- vedi q_network.py).
+
+    Il next-state della transizione salvata in posizione idx e' l'embedding
+    salvato in posizione (idx+1) % capacity: dato che push() viene chiamata
+    una volta per step, in ordine, questo e' esattamente lo stato osservato
+    subito dopo l'azione. Quando un episodio finisce, il "next" apparente
+    (posizione idx+1, che verra' sovrascritta da un episodio futuro) e'
+    comunque ignorato nel calcolo del target perche' moltiplicato per
+    (1 - done) = 0.
+    """
+
+    def __init__(self, capacity, embed_dim, history_dim):
+        self.capacity = capacity
+        self.pos = 0
+        self.size = 0
+        self.embeds = np.zeros((capacity, embed_dim), dtype=np.float32)
+        self.histories = np.zeros((capacity, history_dim), dtype=np.float32)
+        self.actions = np.zeros(capacity, dtype=np.int64)
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        self.dones = np.zeros(capacity, dtype=np.float32)
+
+    def estimated_bytes(self):
+        return (
+            self.embeds.nbytes + self.histories.nbytes + self.actions.nbytes
+            + self.rewards.nbytes + self.dones.nbytes
+        )
+
+    def push(self, embed, history, action, reward, done):
+        idx = self.pos
+        self.embeds[idx] = embed
+        self.histories[idx] = history
+        self.actions[idx] = action
+        self.rewards[idx] = reward
+        self.dones[idx] = done
+        self.pos = (idx + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def __len__(self):
+        return self.size
+
+    def sample(self, batch_size):
+        if self.size < self.capacity:
+            # buffer non ancora pieno: gli indici validi come "stato corrente"
+            # sono [0, size-2], perche' lo stato in size-1 non ha ancora un
+            # "next" scritto in memoria.
+            idx = np.random.randint(0, self.size - 1, size=batch_size)
+        else:
+            # buffer pieno e circolare: l'unico indice da evitare come
+            # "stato corrente" e' pos-1 (il piu' recente), perche' la sua
+            # posizione next (pos) e' la piu' vecchia, sul punto di essere
+            # sovrascritta / gia' logicamente "futura" rispetto ad esso.
+            offset = np.random.randint(0, self.capacity - 1, size=batch_size)
+            idx = (self.pos + offset) % self.capacity
+
+        next_idx = (idx + 1) % self.capacity
+
+        embeds = self.embeds[idx]
+        next_embeds = self.embeds[next_idx]
+        histories = self.histories[idx]
+        next_histories = self.histories[next_idx]
+        actions = self.actions[idx]
+        rewards = self.rewards[idx]
+        dones = self.dones[idx]
+        return embeds, histories, actions, rewards, next_embeds, next_histories, dones
+
+
+def prepare_state(obs, device):
+    reg = torch.from_numpy(obs["region"]).unsqueeze(0).to(device, non_blocking=True)
+    hist = torch.from_numpy(obs["history"]).unsqueeze(0).to(device, non_blocking=True)
+    return reg, hist
+
+
+def build_dataset_config(args):
+    dataset_source = args.dataset_source or os.environ.get("DATASET_SOURCE", "kaggle")
+    dataset_local_path = args.dataset_path or os.environ.get("DATASET_PATH", None)
+    kaggle_id = args.kaggle_id or os.environ.get(
+        "KAGGLE_DATASET_ID", "pkdarabi/brain-tumor-image-dataset-semantic-segmentation"
+    )
+    if dataset_source == "local" and not dataset_local_path:
+        raise SystemExit("--dataset-source=local richiede anche --dataset-path")
+
+    return {
+        "dataset": {
+            "source": dataset_source, "kaggle_id": kaggle_id, "local_path": dataset_local_path,
+            "image_size": [224, 224], "in_channels": 3,
+            "train_ratio": (1501/2145), "val_ratio": (429/2145), "cache_pairs": False,
+        },
+        "preprocessing": {
+            "normalization": "per_image", "binarize_mask": True, "mask_threshold": 0.5,
+            "white_balance": True, "clahe": True, "denoise": False,
+        },
+        "training": {"batch_size": 512, "num_workers": 0},
+        "output": {"root": args.output_root},
+        "seed": 42,
+    }
 
 def build_arg_parser():
     p = argparse.ArgumentParser()
@@ -59,10 +196,16 @@ def build_arg_parser():
     p.add_argument("--dataset-path", type=str, default=None)
     p.add_argument("--kaggle-id", type=str, default=None)
     p.add_argument("--n-envs", type=int, default=6)
-    p.add_argument("--n-epochs", type=int, default=6)
+    p.add_argument("--n-epochs", type=int, default=15)
     p.add_argument("--n-iterations", type=int, default=110, help="quante volte ripetere model.learn(total_timesteps)")
     p.add_argument("--checkpoint-every", type=int, default=10_000, help="ogni quanti step salvare modello+vecnormalize")
     p.add_argument("--output-root", type=str, default="./ppo_brain_tumor_logs")
+
+    # MEMFIX: dimensione del replay buffer ora configurabile da CLI, cosi'
+    # non serve piu' modificare il codice per bilanciare la RAM disponibile.
+    p.add_argument("--replay-size", type=int, default=REPLAY_SIZE,
+                    help="capacita' del replay buffer DQN (buffer basato su embedding: "
+                         "poche decine di byte/KB per transizione, vedi commenti in cima al file)")
 
     # modalità alternative: valutazione o osservazione dal vivo senza (ri)allenare
     p.add_argument("--eval-only", action="store_true")
@@ -96,431 +239,172 @@ def build_arg_parser():
     return p
 
 
-def build_dataset_config(args):
-    dataset_source = args.dataset_source or os.environ.get("DATASET_SOURCE", "kaggle")
-    dataset_local_path = args.dataset_path or os.environ.get("DATASET_PATH", None)
-    kaggle_id = args.kaggle_id or os.environ.get(
-        "KAGGLE_DATASET_ID", "pkdarabi/brain-tumor-image-dataset-semantic-segmentation"
-    )
-    if dataset_source == "local" and not dataset_local_path:
-        raise SystemExit("--dataset-source=local richiede anche --dataset-path")
+def train():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True  # input a dimensione fissa -> conviene l'autotuner cudnn
 
-    return {
-        "dataset": {
-            "source": dataset_source, "kaggle_id": kaggle_id, "local_path": dataset_local_path,
-            "image_size": [224, 224], "in_channels": 1,
-            "train_ratio": (1501/2145), "val_ratio": (429/2145), "cache_pairs": False,
-        },
-        "preprocessing": {
-            "normalization": "per_image", "binarize_mask": True, "mask_threshold": 0.5,
-            "white_balance": True, "clahe": True, "denoise": False,
-        },
-        "training": {"batch_size": 512, "num_workers": 0},
-        "output": {"root": args.output_root},
-        "seed": 42,
-    }
-
-
-def make_train_env_fn(train_ds, initial_min_steps_before_stop, localizer_fn=None, continuous_actions=False):
-    def _init():
-        env = BrainTumorRL_Env(
-            pytorch_dataset=train_ds, max_steps=MAX_STEPS_PER_EPISODE,
-            min_steps_before_stop=initial_min_steps_before_stop, init_difficulty=0.0,
-            localizer_fn=localizer_fn, continuous_actions=continuous_actions,
-        )
-        return env if continuous_actions else ActionMasker(env, mask_fn)
-    return _init
-
-
-def make_eval_env_fn(val_ds, init_difficulty=0.5, localizer_fn=None, continuous_actions=False):
-    def _init():
-        env = BrainTumorRL_Env(pytorch_dataset=val_ds, max_steps=MAX_STEPS_PER_EPISODE,
-                                min_steps_before_stop=0, init_difficulty=init_difficulty,
-                                localizer_fn=localizer_fn, continuous_actions=continuous_actions)
-        return env if continuous_actions else ActionMasker(env, mask_fn)
-    return _init
-
-
-def load_model_and_vecenv(args, dummy_env_fn):
-    if not args.model_path:
-        raise SystemExit("--model-path e' richiesto per --eval-only / --watch-idx")
-
-    raw_env = DummyVecEnv([dummy_env_fn])
-    raw_env = VecMonitor(raw_env)
-    if args.vecnorm_path and os.path.exists(args.vecnorm_path):
-        vec_env = VecNormalize.load(args.vecnorm_path, raw_env)
-        vec_env.training = False
-        vec_env.norm_reward = False
-    else:
-        print("[warn] nessun vecnorm-path valido: procedo senza normalizzazione (potrebbe degradare le prestazioni).")
-        vec_env = raw_env
-
-    model_cls = SAC if args.continuous else MaskablePPO
-    model = model_cls.load(args.model_path)
-    return model, vec_env
-
-
-def run_manual_simulation(dataset, args):
-    """Apre una finestra interattiva per testare manualmente l'ambiente (PPO e SAC)."""
-    import cv2
-    
-    print("\n" + "="*75)
-    print(f"[SIMULAZIONE] AVVIO SESSIONE MANUALE INTERATTIVA")
-    print(f"[SIMULAZIONE] Spazio delle Azioni: {'CONTINUO (SAC)' if args.continuous else 'DISCRETO (PPO)'}")
-    print("="*75)
-    if not args.continuous:
-        print(" CONTROLLI DA TASTIERA (Modalità Discreta PPO):")
-        print("  • W / S   : Sposta Box su / giù")
-        print("  • A / D   : Sposta Box sinistra / destra")
-        print("  • E / Q   : Espandi / Riduci Larghezza (w)")
-        print("  • R / F   : Espandi / Riduci Altezza (h)")
-        print("  • SPAZIO  : Esegui azione di STOP (Termina ed emette i terminal bonus)")
-    else:
-        print(" CONTROLLI TRAMITE SLIDER + TASTIERA (Modalità Continua SAC):")
-        print("  • Usa i 4 Slider/Trackbar OpenCV a schermo per regolare [dx, dy, dw, dh] in [-1.0, 1.0]")
-        print("  • SPAZIO  : Conferma e applica il vettore impostato (Esegue lo Step)")
-    print("\n CONTROLLI GENERALI:")
-    print("  • N       : Forza il Reset dell'ambiente (Cambia immagine / Campione)")
-    print("  • ESC / Q : Chiudi il simulatore ed esci")
-    print("="*75 + "\n")
-
-    # Inizializziamo l'ambiente a difficoltà intermedia (0.5) per il test manuale
-    env = BrainTumorRL_Env(
-        pytorch_dataset=dataset, max_steps=MAX_STEPS_PER_EPISODE,
-        min_steps_before_stop=0, init_difficulty=0.5,
-        continuous_actions=args.continuous, render_mode="rgb_array"
-    )
-
-    window_name = "Simulatore Manuale Ambiente BrainTumorRL"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-
-    if args.continuous:
-        # I trackbar di OpenCV lavorano solo con interi positivi.
-        # Definiamo un range 0-200, dove il valore di default 100 mappa a 0.0.
-        def nothing(x): pass
-        cv2.createTrackbar("dx (Centro X)", window_name, 100, 200, nothing)
-        cv2.createTrackbar("dy (Centro Y)", window_name, 100, 200, nothing)
-        cv2.createTrackbar("dw (Larghezza)", window_name, 100, 200, nothing)
-        cv2.createTrackbar("dh (Altezza)", window_name, 100, 200, nothing)
-
-    obs, _ = env.reset()
-    done = False
-    last_info = None
-
-    while True:
-        # Genera il frame standard dell'ambiente
-        frame = env.render()
-        
-        # Costruiamo una sezione inferiore extra (HUD) nera per stampare la scomposizione dettagliata del reward
-        h, w, _ = frame.shape
-        hud_panel = np.zeros((110, w, 3), dtype=np.uint8)
-        
-        # Titolo della modalità corrente
-        mode_text = "MOD: SAC (Continuo) | Regola slider + SPAZIO per confermare" if args.continuous else "MOD: PPO (Discreto) | Usa W/A/S/D, Q/E, F/R | SPAZIO=STOP"
-        cv2.putText(hud_panel, mode_text, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1, cv2.LINE_AA)
-        
-        if last_info and "rew_components" in last_info:
-            rc = last_info["rew_components"]
-            rew_line = f"Reward Step: {rc.get('total', 0.0):+.3f}  [dIoU: {rc.get('delta_iou', 0.0):+.3f} | dDist: {rc.get('delta_dist', 0.0):+.3f}]"
-            pen_line = f"Penalita':  [Oversize: {rc.get('oversize_penalty', 0.0):+.3f} | Osc/Smooth: {rc.get('oscillation_penalty', 0.0):+.3f}]"
-            
-            cv2.putText(hud_panel, rew_line, (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(hud_panel, pen_line, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 140, 255), 1, cv2.LINE_AA)
-            
-            if done:
-                cv2.putText(hud_panel, "EPISODIO TERMINATO! Premi 'N' per ricominciare.", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
-        else:
-            cv2.putText(hud_panel, "In attesa della prima mossa per calcolare il reward...", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1, cv2.LINE_AA)
-
-        # Uniamo verticalmente il render dell'ambiente e il nostro HUD personalizzato
-        full_display = np.vstack([frame, hud_panel])
-        cv2.imshow(window_name, full_display)
-
-        # Aspetta l'input da tastiera (timeout di 30ms per tenere fluida la UI)
-        key = cv2.waitKey(30) & 0xFF
-
-        # Esci dalla simulazione (ESC o Q)
-        if key == 27 or key == ord('q') or key == ord('Q'):
-            print("[SIMULAZIONE] Sessione conclusa dall'utente.")
-            break
-            
-        # Forza il reset / Cambio immagine (N)
-        if key == ord('n') or key == ord('N'):
-            print("[SIMULAZIONE] Reset dell'ambiente caricato su un nuovo campione casuale.")
-            obs, _ = env.reset()
-            done = False
-            last_info = None
-            if args.continuous:
-                cv2.setTrackbarPos("dx (Centro X)", window_name, 100)
-                cv2.setTrackbarPos("dy (Centro Y)", window_name, 100)
-                cv2.setTrackbarPos("dw (Larghezza)", window_name, 100)
-                cv2.setTrackbarPos("dh (Altezza)", window_name, 100)
-            continue
-
-        # Se l'episodio è finito (Truncated o Terminated), blocca gli step finché l'utente non resetta con 'N'
-        if done:
-            continue
-
-        action = None
-        
-        # Logica di cattura azione se l'ambiente è DISCRETO (PPO)
-        if not args.continuous:
-            # Mappatura azioni: 0: left, 1: right, 2: up, 3: down, 4: w+, 5: w-, 6: h+, 7: h-, 8: STOP
-            if key == ord('a') or key == ord('A'):   action = 0
-            elif key == ord('d') or key == ord('D'): action = 1
-            elif key == ord('w') or key == ord('W'): action = 2
-            elif key == ord('s') or key == ord('S'): action = 3
-            elif key == ord('e') or key == ord('E'): action = 4
-            elif key == ord('q') or key == ord('Q'): action = 5
-            elif key == ord('r') or key == ord('R'): action = 6
-            elif key == ord('f') or key == ord('F'): action = 7
-            elif key == 32:  # Barra Spazio -> STOP
-                action = 8
-                
-        # Logica di cattura azione se l'ambiente è CONTINUO (SAC)
-        else:
-            if key == 32:  # Barra Spazio -> Applica i trackbar correnti
-                # Estrai le posizioni degli slider (intervallo 0-200)
-                tx = cv2.getTrackbarPos("dx (Centro X)", window_name)
-                ty = cv2.getTrackbarPos("dy (Centro Y)", window_name)
-                tw = cv2.getTrackbarPos("dw (Larghezza)", window_name)
-                th = cv2.getTrackbarPos("dh (Altezza)", window_name)
-                
-                # Sottrai 100 e dividi per 100 per rimappare linearmente in [-1.0, 1.0]
-                dx = (tx - 100) / 100.0
-                dy = (ty - 100) / 100.0
-                dw = (tw - 100) / 100.0
-                dh = (th - 100) / 100.0
-                
-                action = np.array([dx, dy, dw, dh], dtype=np.float32)
-
-        # Se l'utente ha impartito un comando valido, esegui lo step nell'ambiente
-        if action is not None:
-            obs, reward, terminated, truncated, info = env.step(action)
-            last_info = info
-            done = terminated or truncated
-            
-            if done:
-                print(f"[SIMULAZIONE] Episodio concluso! Passi totali: {env.current_step}. IoU Finale: {info.get('iou_instant', 0.0):.4f}")
-                if "episode_metrics" in info:
-                    print(f"               Metrica IoU Media Episodio: {info['episode_metrics'].get('ep_iou_mean', 0.0):.4f}")
-
-    cv2.destroyAllWindows()
-
-
-def preview_datasets_as_video(train_ds, test_ds):
-    import cv2
-    import numpy as np
-    
-    print("\n" + "="*70)
-    print("[PREVIEW] ATTIVAZIONE ANTEPRIMA VISIVA PRE-TRAINING")
-    print("[PREVIEW] Le immagini scorreranno automaticamente a schermo.")
-    print("[PREVIEW] - Premi 'SPAZIO' per mettere in PAUSA / RIPRENDERE")
-    print("[PREVIEW] - Premi 'Q' in qualunque momento per iniziare il TRAINING.")
-    print("="*70 + "\n")
-    
-    cv2.namedWindow("Verifica Preprocessing (Scala di Grigi)", cv2.WINDOW_NORMAL)
-    
-    paused = False
-    for name, ds in [("TRAIN SET", train_ds), ("TEST SET", test_ds)]:
-        print(f"[PREVIEW] Avvio riproduzione {name} ({len(ds)} immagini totali)...")
-        i = 0
-        while i < len(ds):
-            sample = ds[i]
-            img_tensor = sample["image"].numpy()     # Shape: [1, 224, 224]
-            mask_tensor = sample["mask"].numpy().squeeze(0) # Shape: [224, 224]
-            
-            img_gray = img_tensor[0]
-            if img_gray.max() <= 1.0:
-                img_gray = (img_gray * 255).astype(np.uint8)
-            else:
-                img_gray = img_gray.astype(np.uint8)
-                
-            display_frame = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
-            
-            contours, _ = cv2.findContours((mask_tensor * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(display_frame, contours, -1, (0, 255, 0), 2)
-            
-            cv2.putText(display_frame, f"{name} - Idx: {i}/{len(ds)}", (10, 20), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(display_frame, f"Polarity: {sample['polarity']}", (10, 40), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
-            
-            cv2.imshow("Verifica Preprocessing (Scala di Grigi)", display_frame)
-            
-            delay = 0 if paused else 100
-            key = cv2.waitKey(delay) & 0xFF
-            
-            if key == ord('q') or key == ord('Q'):
-                print("[PREVIEW] Anteprima interrotta dall'utente. Avvio del training in corso...")
-                cv2.destroyAllWindows()
-                return
-            elif key == ord(' '):  
-                paused = not paused
-                print(f"[PREVIEW] Stato di pausa: {paused}")
-                continue
-                
-            if not paused:
-                i += 1
-                
-    cv2.destroyAllWindows()
-    print("[PREVIEW] Visualizzazione completata di tutti i campioni.")
-
-def main():
     args = build_arg_parser().parse_args()
     cfg = build_dataset_config(args)
-    os.makedirs(cfg["output"]["root"], exist_ok=True)
 
-    print(f"[data] Sorgente dataset selezionata: '{cfg['dataset']['source']}'")
-    train_ds, val_ds, test_ds = get_datasets(cfg)
+    train_ds, val_ds, _ = get_datasets(cfg)
 
-    # --- INSERISCI LA CHIAMATA QUI SOTTO ---
-    #preview_datasets_as_video(train_ds, test_ds)
-    # ---------------------------------------
-    
-    # ── NUOVA MODALITÀ: Simulazione interattiva manuale ed immediata ────
-    if args.simulate:
-        run_manual_simulation(train_ds, args)
-        return
+    env = ActiveLocalizationEnv(train_ds)
 
-    # ── warm-start supervisionato (vedi localizer.py) ───────────────────
-    localizer_path = args.localizer_path or os.path.join(cfg["output"]["root"], "localizer.pt")
-    if args.train_localizer:
-        print(f"[localizer] training del regressore supervisionato ({args.localizer_epochs} epoche)...")
-        train_localizer(train_ds, val_ds, save_path=localizer_path, epochs=args.localizer_epochs)
+    # FIX (backbone pre-addestrato condiviso): un solo VisualBackbone (ResNet18
+    # ImageNet, congelato) istanziato una volta e condiviso da policy_net e
+    # target_net -- vedi q_network.py per il perche' (era un proiettore
+    # casuale mai addestrato, ora e' un vero extractor pre-addestrato; e
+    # condividerlo evita di duplicare inutilmente pesi congelati in VRAM).
+    backbone = VisualBackbone().to(device)
+    policy_net = ActiveLocalizationQNet(backbone, in_channels=cfg["dataset"]["in_channels"]).to(device)
+    target_net = ActiveLocalizationQNet(backbone, in_channels=cfg["dataset"]["in_channels"]).to(device)
+    target_net.q_net.load_state_dict(policy_net.q_net.state_dict())
+    target_net.eval()
 
-    localizer_fn = None
-    if args.use_localizer:
-        if not os.path.exists(localizer_path):
-            raise SystemExit(f"--use-localizer richiesto ma nessun checkpoint trovato in {localizer_path}. "
-                              f"Usa anche --train-localizer, oppure passa --localizer-path corretto.")
-        loc_model, loc_device = load_localizer(localizer_path, device="cpu")
-        localizer_fn = make_localizer_fn(loc_model, loc_device)
-        print(f"[localizer] warm-start attivo, checkpoint: {localizer_path}")
+    # Solo il q_net e' allenato: il backbone e' congelato (requires_grad=False).
+    optimizer = optim.SGD(policy_net.q_net.parameters(), lr=LR, momentum=0.9)
 
-    # ── modalità: solo valutazione visiva su un modello già allenato ────
-    if args.eval_only or args.watch_idx is not None:
-        model, _ = load_model_and_vecenv(args, make_eval_env_fn(val_ds, localizer_fn=localizer_fn, continuous_actions=args.continuous))
-        evaluator = VisualEvaluator(model=model, test_ds=test_ds,
-                                     output_dir=os.path.join(cfg["output"]["root"], "test_eval"),
-                                     max_steps=MAX_STEPS_PER_EPISODE, seed=cfg["seed"],
-                                     localizer_fn=localizer_fn, continuous_actions=args.continuous)
-        if args.watch_idx is not None:
-            evaluator.watch(args.watch_idx)
-            evaluator.save_episode_video(args.watch_idx)
-            evaluator.save_episode_steps_grid(args.watch_idx)
+    first_obs, _ = env.reset()
+    history_dim = first_obs["history"].shape[0]
+    embed_dim = backbone.out_dim
+    memory = ReplayBuffer(args.replay_size, embed_dim, history_dim)
+    print(f"[memory] Replay buffer: capacity={args.replay_size} "
+          f"~{memory.estimated_bytes() / (1024**3):.4f} GiB stimati")
+
+    EPOCHS = args.n_epochs  # FIX: prima era hard-codato a 15 e ignorava --n-epochs
+    steps_done = 0
+
+    # FIX (epoca fedele al paper): generatore dedicato per le permutazioni di
+    # ogni epoca, seedato per riproducibilita' ma indipendente da env.np_random
+    # (che gestisce solo il fallback random di reset() quando non si passa idx).
+    epoch_rng = np.random.default_rng(cfg["seed"])
+
+    for epoch in range(1, EPOCHS + 1):
+        # FIX (schedule di epsilon): il paper vuole epsilon=1.0 ESATTO alla
+        # prima epoca, poi lineare fino a 0.1 alla quinta. La vecchia formula
+        # 1.0 - 0.9*(epoch/5.0) dava 0.82 alla prima epoca (raggiungeva 0.1
+        # solo alla quinta, ma con una curva shiftata). Con (epoch-1)/4.0:
+        # epoch=1 -> 1.0, epoch=5 -> 0.1, lineare nel mezzo.
+        if epoch <= 5:
+            epsilon = 1.0 - (0.9 * ((epoch - 1) / 4.0))
         else:
-            evaluator.evaluate_dataset(max_samples=0)
-        return
+            epsilon = 0.1
 
-    # ── training ──────────────────────────────────────────────────────
-    check_env(BrainTumorRL_Env(pytorch_dataset=train_ds, max_steps=MAX_STEPS_PER_EPISODE,
-                                localizer_fn=localizer_fn, continuous_actions=args.continuous))
+        # FIX (definizione di "epoca" fedele al paper): permutazione SENZA
+        # rimpiazzo dell'intero training set, invece del campionamento CON
+        # rimpiazzo che c'era prima dentro env.reset(). Ogni immagine viene
+        # vista esattamente una volta per epoca.
+        epoch_order = epoch_rng.permutation(len(train_ds))
 
-    N_ENVS = args.n_envs
-    N_EPOCHS = args.n_epochs
-    GAMMA = 0.99
-    N_STEPS = 1024
-    STOP_CURRICULUM_STEPS = 350_000
+        epoch_rewards = []
+        epoch_ious = []
+        epoch_episode_steps = []
 
-    INITIAL_MIN_STEPS_BEFORE_STOP = MAX_STEPS_PER_EPISODE + 1
-    FINAL_MIN_STEPS_BEFORE_STOP = 0
-
-    env_fn = make_train_env_fn(train_ds, INITIAL_MIN_STEPS_BEFORE_STOP, localizer_fn=localizer_fn,
-                                continuous_actions=args.continuous)
-    vec_env = SubprocVecEnv([env_fn for _ in range(N_ENVS)])
-    vec_env = VecMonitor(vec_env)
-    vec_env = VecNormalize(vec_env, norm_obs=False, norm_reward=True, clip_reward=10.0, gamma=GAMMA)
-
-    eval_env_raw = DummyVecEnv([make_eval_env_fn(val_ds, localizer_fn=localizer_fn, continuous_actions=args.continuous)])
-    eval_env_raw = VecMonitor(eval_env_raw)
-    eval_env = VecNormalize(eval_env_raw, norm_obs=False, norm_reward=False, gamma=GAMMA, training=False)
-
-    visual_callback = VisionMetricsCallback(val_dataset=val_ds,
-                                             save_dir=os.path.join(cfg["output"]["root"], "gradcam_outputs"),
-                                             continuous=args.continuous)
-    adaptive_curriculum_callback = AdaptiveCurriculumCallback(
-        n_stages=6, initial_difficulty=0.0, final_difficulty=1.0,
-        window=50, min_steps_per_stage=5_000, advance_threshold=0.55,
-        regress_threshold=0.20, stall_patience=300_000,
-        reheat_ent=0.03, floor_ent=0.01,
-        reheat_step_frac=0.05, floor_step_frac=0.012,
-        reheat_duration=60_000,
-        manage_entropy=not args.continuous,
-    )
-
-    callback_list_items = [visual_callback, adaptive_curriculum_callback]
-    if not args.continuous:
-        stop_curriculum_callback = StopCurriculumCallback(curriculum_steps=STOP_CURRICULUM_STEPS,
-                                                           initial_min_steps=INITIAL_MIN_STEPS_BEFORE_STOP,
-                                                           final_min_steps=FINAL_MIN_STEPS_BEFORE_STOP)
-        callback_list_items.append(stop_curriculum_callback)
-
-    checkpoint_dir = os.path.join(cfg["output"]["root"], "checkpoints")
-    model_checkpoint_callback = ModelCheckpointCallback(
-        save_freq=args.checkpoint_every, save_dir=checkpoint_dir, vec_env=vec_env,
-        name_prefix="ppo_brain_tumor", keep_last=10,
-    )
-
-    stop_on_no_improve = StopTrainingOnNoModelImprovement(max_no_improvement_evals=120, min_evals=180, verbose=1)
-    if args.continuous:
-        eval_callback = EvalCallback(
-            eval_env, best_model_save_path=os.path.join(cfg["output"]["root"], "best_model/"),
-            log_path=os.path.join(cfg["output"]["root"], "eval_results/"),
-            eval_freq=max(N_STEPS * 4, 2000), n_eval_episodes=20, deterministic=True,
-            callback_after_eval=stop_on_no_improve, verbose=1,
-        )
-    else:
-        eval_callback = MaskableEvalCallback(
-            eval_env, best_model_save_path=os.path.join(cfg["output"]["root"], "best_model/"),
-            log_path=os.path.join(cfg["output"]["root"], "eval_results/"),
-            eval_freq=max(N_STEPS * 4, 2000), n_eval_episodes=20, deterministic=True,
-            use_masking=True, callback_after_eval=stop_on_no_improve, verbose=1,
-        )
-    callback_list_items += [model_checkpoint_callback, eval_callback]
-    callbacks = CallbackList(callback_list_items)
-
-    if args.total_timesteps is not None:
-        total_timesteps = args.total_timesteps
-    else:
-        total_timesteps = int(os.environ.get("TOTAL_TIMESTEPS", 100_000))
-
-    if args.continuous:
-        policy_kwargs = dict(features_extractor_kwargs=dict(cnn_output_dim=512),
-                              net_arch=dict(pi=[256, 256], qf=[256, 256]))
-        model = SAC(
-            policy="MultiInputPolicy", env=vec_env, policy_kwargs=policy_kwargs,
-            learning_rate=3e-4, buffer_size=args.sac_buffer_size,
-            learning_starts=args.sac_learning_starts, batch_size=256,
-            tau=0.005, gamma=GAMMA, train_freq=1, gradient_steps=1,
-            ent_coef="auto", optimize_memory_usage=False,
-            replay_buffer_kwargs=dict(handle_timeout_termination=False),
-            verbose=1, tensorboard_log=os.path.join(cfg["output"]["root"], "tb"),
-        )
-    else:
-        policy_kwargs = dict(features_extractor_kwargs=dict(cnn_output_dim=512),
-                              net_arch=dict(pi=[256, 256], vf=[256, 256]))
-        model = MaskablePPO(
-            policy="MultiInputPolicy", env=vec_env, policy_kwargs=policy_kwargs,
-            learning_rate=linear_schedule(1.5e-4, 1e-5), n_steps=N_STEPS, batch_size=1024,
-            n_epochs=N_EPOCHS, gamma=GAMMA, gae_lambda=0.95, clip_range=linear_schedule(0.1, 0.03),
-            ent_coef=0.03, vf_coef=0.5, max_grad_norm=0.5, verbose=1,
-            tensorboard_log=os.path.join(cfg["output"]["root"], "tb"), target_kl=0.03,
+        progress_bar = tqdm(
+            epoch_order,
+            desc=f"Epoca {epoch}/{EPOCHS}",
+            unit="img",
+            leave=True
         )
 
-    for i in range(1, args.n_iterations + 1):
-        model.learn(total_timesteps=total_timesteps, callback=callbacks, reset_num_timesteps=(i == 1))
-        model.save(os.path.join(cfg["output"]["root"], f"{total_timesteps * i}"))
+        for img_idx in progress_bar:
+            obs, _ = env.reset(options={"idx": int(img_idx)})
+            done = False
+            episode_reward = 0
+            ep_steps = 0
 
-    vec_env.save(os.path.join(cfg["output"]["root"], "vecnormalize_stats.pkl"))
+            while not done:
+                reg, hist = prepare_state(obs, device)
 
-    eval_output_dir = os.path.join(cfg["output"]["root"], "test_eval")
-    evaluator = VisualEvaluator(model=model, test_ds=test_ds,
-                                 output_dir=eval_output_dir,
-                                 max_steps=MAX_STEPS_PER_EPISODE, seed=cfg["seed"],
-                                 localizer_fn=localizer_fn, continuous_actions=args.continuous)
-    evaluator.evaluate_dataset(max_samples=0)
+                # FIX (embedding cache): un solo forward del backbone per
+                # step, riusato sia per la scelta dell'azione sia per il push
+                # nel replay buffer (vedi ReplayBuffer piu' sopra).
+                with torch.no_grad():
+                    visual_emb = policy_net.encode(reg)
+
+                # Epsilon-greedy con Apprenticeship Learning
+                if random.random() < epsilon:
+                    positive_actions = env.get_positive_actions()
+                    action = random.choice(positive_actions) if positive_actions else random.randrange(N_ACTIONS)
+                else:
+                    policy_net.eval()  # FIX: disattiva il Dropout durante la selezione greedy dell'azione
+                    with torch.inference_mode():
+                        q_vals = policy_net(visual_emb, hist)
+                        action = q_vals.argmax(dim=1).item()
+
+                next_obs, reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+
+                memory.push(visual_emb.squeeze(0).cpu().numpy(), obs["history"], action, float(reward), done)
+                obs = next_obs
+                steps_done += 1
+
+                episode_reward += reward
+                ep_steps += 1
+
+                if len(memory) > BATCH_SIZE and (steps_done % UPDATE_FREQ == 0):
+                    policy_net.train()  # riattiva il Dropout per l'update (il backbone resta comunque in eval, vedi VisualBackbone.train())
+
+                    embeds, histories, actions, rewards, n_embeds, n_histories, dones = memory.sample(BATCH_SIZE)
+
+                    emb_b = torch.from_numpy(embeds).to(device, non_blocking=True)
+                    hist_b = torch.from_numpy(histories).to(device, non_blocking=True)
+                    act_b = torch.from_numpy(actions).unsqueeze(1).to(device, non_blocking=True)
+                    rew_b = torch.from_numpy(rewards).to(device, non_blocking=True)
+                    n_emb_b = torch.from_numpy(n_embeds).to(device, non_blocking=True)
+                    n_hist_b = torch.from_numpy(n_histories).to(device, non_blocking=True)
+                    done_b = torch.from_numpy(dones).to(device, non_blocking=True)
+
+                    state_action_values = policy_net(emb_b, hist_b).gather(1, act_b).squeeze(1)
+                    with torch.inference_mode():
+                        next_state_values = target_net(n_emb_b, n_hist_b).max(1)[0]
+                    expected_state_action_values = rew_b + (GAMMA * next_state_values * (1 - done_b))
+
+                    loss = nn.MSELoss()(state_action_values, expected_state_action_values)
+
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    optimizer.step()
+
+                if steps_done % TARGET_UPDATE == 0:
+                    # Solo il q_net va sincronizzato: il backbone e' la STESSA
+                    # istanza condivisa tra policy_net e target_net, quindi e'
+                    # gia' identico e non va mai ricopiato.
+                    target_net.q_net.load_state_dict(policy_net.q_net.state_dict())
+
+            final_iou = compute_iou(env.box, env.gt_box)
+            epoch_rewards.append(float(episode_reward))
+            epoch_ious.append(float(final_iou))
+            epoch_episode_steps.append(ep_steps)
+
+            progress_bar.set_postfix({
+                "IoU": f"{np.mean(epoch_ious):.3f}",
+                "Rew": f"{np.mean(epoch_rewards):.2f}",
+                "Steps": f"{np.mean(epoch_episode_steps):.1f}",
+                "eps": f"{epsilon:.2f}"
+            })
+
+        os.makedirs(cfg["output"]["root"], exist_ok=True)
+        # FIX: si salva solo il q_net (la parte allenata), non piu' l'intero
+        # state_dict di policy_net -- il backbone e' un ResNet18 ImageNet
+        # sempre identico e ricostruibile da VisualBackbone(), non ha senso
+        # riscrivere ~45MB di pesi congelati identici ad ogni singola epoca.
+        # NOTA formato checkpoint: per ricaricare, ricreare VisualBackbone() +
+        # ActiveLocalizationQNet(backbone) e fare load_state_dict solo su
+        # policy_net.q_net con il contenuto di "q_net_state_dict".
+        torch.save(
+            {"q_net_state_dict": policy_net.q_net.state_dict(), "backbone_arch": "resnet18_imagenet1k"},
+            f"{cfg['output']['root']}/model_epoch_{epoch}.pth",
+        )
+
+        # gc.collect() a fine epoca (non ad ogni step: sarebbe troppo
+        # costoso) libera eventuali cicli di riferimento residui (es. grafici
+        # autograd non piu' referenziati) prima della prossima epoca.
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
-    main()
+    train()
