@@ -373,7 +373,7 @@ def visualize_progress_gif(env, agent, episode):
 
         # Resetto l'asse per ogni nuovo sample
         ax.clear()
-        ax.imshow(img)
+        ax.imshow(img, cmap='gray')
         ax.axis('off')
 
         # Rettangolo reale (fisso per l'immagine)
@@ -408,7 +408,7 @@ def visualize_progress_gif(env, agent, episode):
             ax.set_title(f"Ep {episode} - Img {i+1} - Step {step}")
             
             fig.canvas.draw()
-            image = np.asarray(fig.canvas.buffer_rgba())
+            image = np.asarray(fig.canvas.buffer_rgba()).copy()
             image = image[:, :, :3]
             
             # Aggiunto l'immagine ai frame
