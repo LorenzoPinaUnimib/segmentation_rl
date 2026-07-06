@@ -97,14 +97,21 @@ def _box_metrics(pred_box, gt_box, image_size=None):
     return metrics
 
 
-def compute_gradcam(model, obs_uint8, device):
-    obs_tensor = torch.tensor(np.expand_dims(obs_uint8, axis=0), dtype=torch.float32).to(device)
+def compute_gradcam(model, obs, device):
+    # FIX (Dict observation space): obs e' ora {"image":..., "box_vec":...}
+    # (vedi BrainTumorRL_Env._get_obs) invece di un array unico -- si
+    # costruisce un tensore per chiave, e il target_layer si legge dal
+    # sotto-estrattore "image" del CombinedExtractor (MultiInputPolicy),
+    # non piu' direttamente da policy.features_extractor.cnn[4].
+    image_tensor = torch.tensor(np.expand_dims(obs["image"], axis=0), dtype=torch.float32).to(device)
+    box_vec_tensor = torch.tensor(np.expand_dims(obs["box_vec"], axis=0), dtype=torch.float32).to(device)
+    obs_tensor = {"image": image_tensor, "box_vec": box_vec_tensor}
     activations, gradients = None, None
 
     def forward_hook(m, i, o): nonlocal activations; activations = o
     def backward_hook(m, gi, go): nonlocal gradients; gradients = go[0]
 
-    target_layer = model.policy.features_extractor.cnn[4]
+    target_layer = model.policy.features_extractor.extractors["image"].cnn[4]
     h1 = target_layer.register_forward_hook(forward_hook)
     h2 = target_layer.register_full_backward_hook(backward_hook)
 
@@ -128,12 +135,21 @@ def compute_gradcam(model, obs_uint8, device):
 
 
 class VisualEvaluator:
-    def __init__(self, model, test_ds, output_dir, max_steps=MAX_STEPS_PER_EPISODE, seed=42):
+    def __init__(self, model, test_ds, output_dir, max_steps=MAX_STEPS_PER_EPISODE, seed=42,
+                 localizer_fn=None, continuous_actions=False):
         self.model = model
         self.test_ds = test_ds
         self.output_dir = output_dir
         self.max_steps = max_steps
         self.seed = seed
+        # FIX (warm-start supervisionato): stesso localizzatore usato in
+        # training, cosi' la valutazione finale riflette le condizioni reali
+        # con cui l'agente e' stato allenato (partenza dalla predizione del
+        # regressore, non da un box completamente casuale come prima).
+        self.localizer_fn = localizer_fn
+        # FIX v7: con SAC/action space continuo non esistono action_masks da
+        # passare a model.predict() (SAC non accetta quel parametro).
+        self.continuous_actions = continuous_actions
         os.makedirs(self.output_dir, exist_ok=True)
 
     # ── rollout di un singolo episodio, con frame ad ogni step ──────────
@@ -142,18 +158,22 @@ class VisualEvaluator:
         env = BrainTumorRL_Env(
             pytorch_dataset=_SingleSampleDataset(sample),
             max_steps=self.max_steps, min_steps_before_stop=0,
-            render_mode=render_mode,
+            render_mode=render_mode, localizer_fn=self.localizer_fn,
+            continuous_actions=self.continuous_actions,
         )
         obs, _ = env.reset(seed=self.seed)
         frames = [env.render()]
         step_log = []  # (action, reward, iou) per step
 
         while True:
-            mask = env.action_masks()
-            action, _ = self.model.predict(obs, deterministic=True, action_masks=mask)
+            if self.continuous_actions:
+                action, _ = self.model.predict(obs, deterministic=True)
+            else:
+                mask = env.action_masks()
+                action, _ = self.model.predict(obs, deterministic=True, action_masks=mask)
             obs, reward, terminated, truncated, info = env.step(action)
             frames.append(env.render())
-            step_log.append((int(action), float(reward), float(info["iou_instant"])))
+            step_log.append((int(action) if not self.continuous_actions else action.tolist(), float(reward), float(info["iou_instant"])))
             if terminated or truncated:
                 break
 
@@ -262,16 +282,20 @@ class VisualEvaluator:
                 boxes_img = result["frames"][-1]
                 cv2.imwrite(os.path.join(boxes_dir, f"{idx:04d}.png"), boxes_img)
 
-                heatmap = compute_gradcam(self.model, result["last_obs"], device)
-                if heatmap is not None:
-                    orig_bgr = to_bgr_image(img_np)
-                    heatmap_resized = cv2.resize(heatmap, (W, H))
-                    heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-                    overlay = cv2.addWeighted(orig_bgr, 0.6, heatmap_colored, 0.4, 0)
-                    gt, pred = result["gt_box"], result["pred_box"]
-                    cv2.rectangle(overlay, (int(gt[0]), int(gt[1])), (int(gt[0]+gt[2]), int(gt[1]+gt[3])), (0,255,0), 2)
-                    cv2.rectangle(overlay, (int(pred[0]), int(pred[1])), (int(pred[0]+pred[2]), int(pred[1]+pred[3])), (0,0,255), 2)
-                    cv2.imwrite(os.path.join(gradcam_dir, f"{idx:04d}.png"), overlay)
+                if not self.continuous_actions:
+                    # FIX v7: compute_gradcam usa model.policy.predict_values,
+                    # specifico delle ActorCriticPolicy di PPO -- SAC ha una
+                    # struttura actor/critic diversa e non espone quel metodo.
+                    heatmap = compute_gradcam(self.model, result["last_obs"], device)
+                    if heatmap is not None:
+                        orig_bgr = to_bgr_image(img_np)
+                        heatmap_resized = cv2.resize(heatmap, (W, H))
+                        heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
+                        overlay = cv2.addWeighted(orig_bgr, 0.6, heatmap_colored, 0.4, 0)
+                        gt, pred = result["gt_box"], result["pred_box"]
+                        cv2.rectangle(overlay, (int(gt[0]), int(gt[1])), (int(gt[0]+gt[2]), int(gt[1]+gt[3])), (0,255,0), 2)
+                        cv2.rectangle(overlay, (int(pred[0]), int(pred[1])), (int(pred[0]+pred[2]), int(pred[1]+pred[3])), (0,0,255), 2)
+                        cv2.imwrite(os.path.join(gradcam_dir, f"{idx:04d}.png"), overlay)
 
                 if (idx + 1) % 25 == 0 or idx == n_samples - 1:
                     print(f"[eval] {idx + 1}/{n_samples}  IoU={m['iou']:.3f}")

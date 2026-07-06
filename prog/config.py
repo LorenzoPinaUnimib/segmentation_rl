@@ -8,8 +8,15 @@ Tenerle in un solo posto evita che i moduli vadano fuori sincrono.
 
 # ── Azioni ────────────────────────────────────────────────────────────────
 N_ACTIONS = 9  # 0-3: sposta centro, 4-7: ridimensiona (w/h), 8: STOP
-MAX_STEPS_PER_EPISODE = 200
-N_COORD_CHANNELS = 4  # piani immagine per cx, cy, w, h normalizzati
+MAX_STEPS_PER_EPISODE = 50
+# FIX (Dict observation space): N_COORD_CHANNELS ora e' la dimensione del
+# vettore box (cx,cy,w,h) passato come input NUMERICO separato alla policy
+# (chiave "box_vec" della Dict obs, vedi environment.py/utils.py), non piu'
+# "spalmato" su 4 piani immagine interi come in precedenza. Dimezza i canali
+# immagine (8->4: 3 RGB + 1 maschera box) -> dimezza la RAM del replay buffer
+# di SAC a parita' di buffer_size, e da' alla rete il box come numero esatto
+# invece che da dedurre da un piano a valore costante.
+N_COORD_CHANNELS = 4
 
 OPPOSITE_ACTIONS = {0: 1, 1: 0, 2: 3, 3: 2, 4: 5, 5: 4, 6: 7, 7: 6}
 
@@ -57,6 +64,13 @@ OVERSIZE_AREA_RATIO_THRESHOLD = 0.50
 OVERSIZE_PENALTY_SCALE = 4.0
 
 OSCILLATION_PENALTY = 0.01
+
+# FIX v7 (action space continuo): penalita' sul "jerk" (variazione tra azioni
+# consecutive) nel ramo continuo di environment.py -- equivalente di
+# OSCILLATION_PENALTY ma per vettori continui invece che azioni discrete
+# opposte. Tenuta volutamente piccola: deve scoraggiare micro-jitter senza
+# impedire correzioni di rotta grandi e legittime.
+ACTION_SMOOTHNESS_PENALTY_SCALE = 0.02
 
 # ── Valutazione ───────────────────────────────────────────────────────────
 SIZE_BUCKET_EDGES = (0.10, 0.20)

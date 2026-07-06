@@ -28,13 +28,50 @@ def set_seed(seed: int) -> None:
 
 
 def get_device(cfg_device: str = "auto") -> torch.device:
-    """Return the best available device."""
-    if cfg_device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    """
+    Restituisce il device migliore disponibile.
+
+    Ordine di preferenza in modalità "auto":
+      1) CUDA (NVIDIA), se disponibile
+      2) DirectML (torch-directml — GPU AMD/Intel/NVIDIA su Windows senza
+         bisogno di CUDA), se il pacchetto è installato
+      3) CPU come fallback
+
+    cfg_device può anche essere impostato esplicitamente a "dml" /
+    "directml" per forzare DirectML.
+    """
+    cfg_device = (cfg_device or "auto").lower()
+
+    if cfg_device in ("dml", "directml"):
+        device = _get_directml_device(required=True)
+    elif cfg_device == "auto":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = _get_directml_device(required=False)
+            if device is None:
+                device = torch.device("cpu")
     else:
         device = torch.device(cfg_device)
+
     print(f"[device] Using: {device}")
     return device
+
+
+def _get_directml_device(required: bool = False):
+    """Prova a ottenere un device DirectML (pacchetto opzionale torch-directml)."""
+    try:
+        import torch_directml
+        device = torch_directml.device()
+        print("[device] DirectML disponibile e selezionato.")
+        return device
+    except ImportError:
+        if required:
+            raise RuntimeError(
+                "DirectML richiesto (device: dml) ma 'torch-directml' non è "
+                "installato. Esegui: pip install torch-directml"
+            )
+        return None
 
 
 def ensure_dirs(cfg: dict) -> None:

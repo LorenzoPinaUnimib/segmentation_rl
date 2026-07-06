@@ -75,6 +75,7 @@ from src.train.rl_trainer import (
     _tensor_to_gray,
     _tensor_to_mask,
 )
+from src.utils.gradcam_utils import GradCAM, overlay_heatmap
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,8 +120,16 @@ def run_roi_finder_inference(
     mask_t: torch.Tensor,
     finder_agent: ROIFinderAgent,
     finder_env: ROIFinderEnv,
+    gradcam: "GradCAM" = None,
 ) -> dict:
-    """Inferenza ROI Finder: restituisce box predetta, GT e metriche."""
+    """
+    Inferenza ROI Finder: restituisce box predetta, GT e metriche.
+
+    Se `gradcam` è fornito, calcola anche la mappa Grad-CAM (chiave
+    'gradcam' nel dict di output) riusando lo stato finale del rollout
+    greedy — un'unica forward+backward extra per immagine, eseguita solo
+    qui (mai durante i passi di training), per minimizzare l'overhead.
+    """
     img_gray = _tensor_to_gray(image_t)
     gt_mask  = _tensor_to_mask(mask_t)
 
@@ -130,13 +139,18 @@ def run_roi_finder_inference(
         action = finder_agent.act(state, greedy=True)
         state, _, done, info = finder_env.step(action)
 
-    return {
+    result = {
         "img_gray": img_gray,
         "gt_mask":  gt_mask,
         "gt_box":   list(finder_env.gt_box),
         "pred_box": finder_env.get_box(),
         "iou":      info["iou"],
     }
+
+    if gradcam is not None:
+        result["gradcam"] = gradcam.generate(state, device=finder_agent.device)
+
+    return result
 
 
 def _overlay_mask_contour(
@@ -166,16 +180,28 @@ def save_test_roi_predictions(
     subdir: str = "final",
     split_name: str = "Test",
     verbose: bool = True,
+    gradcam: "GradCAM" = None,
 ) -> str:
     """
     Salva ogni immagine di test con GT ROI e predizione ROI.
     Output in outputs/predictions/<tag>/<subdir>/.
+
+    Se `gradcam` è fornito (vedi src/utils/gradcam_utils.GradCAM), per ogni
+    campione viene salvata anche la mappa Grad-CAM corrispondente: sia come
+    pannello aggiuntivo nella figura principale, sia come file a parte in
+    <save_dir>/gradcam/.
     """
     save_dir = os.path.join(cfg["output"]["predictions_dir"], tag, subdir)
     os.makedirs(save_dir, exist_ok=True)
+    gradcam_dir = None
+    if gradcam is not None:
+        gradcam_dir = os.path.join(save_dir, "gradcam")
+        os.makedirs(gradcam_dir, exist_ok=True)
 
     if verbose:
         print(f"\n[pipeline] Salvataggio ROI ({split_name}) → {save_dir}")
+        if gradcam is not None:
+            print(f"  + Grad-CAM → {gradcam_dir}")
 
     sample_idx = 0
     grid_rows = []
@@ -185,7 +211,7 @@ def save_test_roi_predictions(
         masks = batch["mask"]
         for i in range(imgs.size(0)):
             result = run_roi_finder_inference(
-                imgs[i], masks[i], finder_agent, finder_env,
+                imgs[i], masks[i], finder_agent, finder_env, gradcam=gradcam,
             )
             img_rgb = _gray_to_rgb(result["img_gray"])
             gt_box = result["gt_box"]
@@ -199,14 +225,22 @@ def save_test_roi_predictions(
                 pred_box, (255, 90, 50), 2, "Pred",
             )
 
-            fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+            titles = ["Ground Truth ROI", "Predicted ROI", "GT + Prediction"]
+            panels = [panel_gt, panel_pred, panel_both]
+
+            if gradcam is not None:
+                cam_overlay = overlay_heatmap(img_rgb, result["gradcam"])
+                titles.append("Grad-CAM")
+                panels.append(cam_overlay)
+                cam_path = os.path.join(gradcam_dir, f"test_{sample_idx:04d}_gradcam.png")
+                cv2.imwrite(cam_path, cv2.cvtColor(cam_overlay, cv2.COLOR_RGB2BGR))
+
+            fig, axes = plt.subplots(1, len(panels), figsize=(4 * len(panels), 4))
             fig.patch.set_facecolor("#0F172A")
             fig.suptitle(
                 f"{split_name} #{sample_idx:04d} — ROI Finder (IoU={iou:.4f})",
                 color="white", fontsize=11, fontweight="bold",
             )
-            titles = ["Ground Truth ROI", "Predicted ROI", "GT + Prediction"]
-            panels = [panel_gt, panel_pred, panel_both]
             for ax, title, panel in zip(axes, titles, panels):
                 ax.imshow(panel)
                 ax.set_title(title, color="white", fontsize=9)
@@ -418,6 +452,7 @@ def make_finder_partial_callback(
     finder_agent: ROIFinderAgent,
     finder_env: ROIFinderEnv,
     cfg: dict,
+    gradcam: "GradCAM" = None,
 ):
     """Callback: salva risultati parziali sul val set ad ogni eval (senza refinement)."""
     def callback(episode: int, stats: dict) -> None:
@@ -426,6 +461,7 @@ def make_finder_partial_callback(
         save_test_roi_predictions(
             val_loader, finder_agent, finder_env, cfg,
             tag="roi_finder", subdir=subdir, split_name="Val", verbose=True,
+            gradcam=gradcam,
         )
         _save_partial_metrics(cfg, "roi_finder_val", episode, {
             "val_iou_mean":   stats.get("mean", 0.0),
@@ -1049,10 +1085,15 @@ def main():
     roi_episodes = rl_cfg.get("roi_episodes", rl_cfg.get("episodes", 300))
     eval_every_1 = max(1, roi_episodes // 15)
 
-    print(f"  State dim: {finder_env.STATE_DIM} | Actions: {finder_env.NUM_ACTIONS}")
+    print(f"  State dim: {finder_env.STATE_CHANNELS}x{finder_env.cnn_size}x{finder_env.cnn_size} (CNN) | Actions: {finder_env.NUM_ACTIONS}")
     print(f"  Episodi: {roi_episodes} | Step max/episodio: {finder_env.max_steps}")
     print(f"  Ogni iterazione = tutte le immagini train")
     print(f"  Validazione su val set ogni {eval_every_1} iterazioni")
+
+    # Grad-CAM sulla CNN del ROI Finder: calcolata SOLO nei momenti di
+    # salvataggio (checkpoint val + test finale), mai durante i singoli step
+    # di training, per non rallentare l'addestramento.
+    finder_gradcam = GradCAM(finder_agent.online, finder_agent.online.gradcam_layer)
 
     finder_trainer = ROIFinderTrainer(
         agent        = finder_agent,
@@ -1062,7 +1103,7 @@ def main():
         device       = device,
         cfg          = cfg,
         on_eval_callback = make_finder_partial_callback(
-            val_loader, finder_agent, finder_env, cfg,
+            val_loader, finder_agent, finder_env, cfg, gradcam=finder_gradcam,
         ),
     )
     finder_trainer.episodes = roi_episodes
@@ -1082,6 +1123,7 @@ def main():
         tag="roi_finder",
         subdir="test_final",
         split_name="Test",
+        gradcam=finder_gradcam,
     )
     roi_test = evaluate_roi_finder_only(test_loader, finder_agent, finder_env)
     _save_partial_metrics(cfg, "roi_finder_test", roi_episodes, {
@@ -1166,7 +1208,11 @@ def main():
         ),
     )
     refiner_trainer.episodes = refine_episodes
-    '''
+
+    # OTTIMIZZAZIONE: il blocco Step 5-7 (training+eval Agent 2 / pipeline
+    # completa) era stato lasciato commentato con triple-quote nel file
+    # originale -> la pipeline "doppio RL" non veniva mai completata, si
+    # allenava e valutava solo l'Agent 1. Riattivato qui integralmente.
     # ── 5) Training Agent 2 ───────────────────────────────────────────────────
     print("\n[pipeline] Step 5: Training Agent 2 (ROI Refiner)...")
     history_refiner = refiner_trainer.train(eval_every=eval_every_2)
@@ -1291,7 +1337,10 @@ def main():
     print(f"  Dual RL Dice μ            : {rl.get('dice', 0):.4f} ± {results['dice_rl_std']:.4f}")
     print(f"  Dual RL Dice mediana      : {results['dice_rl_median']:.4f}")
     print(f"  Miglioramento Dice        : {rl.get('dice', 0) - bl.get('dice', 0):+.4f}")
-    '''
+
+    if detection_results:
+        print(f"  ROI Detection Accuracy (IoU>0.5) : {detection_results['accuracy']:.4f}")
+        print(f"  ROI Detection Found rate         : {detection_results['found_rate']*100:.1f}%")
 
     # ── Fine (con solo Agent 1 attivo) ───────────────────────────────────────
     print("\n" + "="*60)
@@ -1309,7 +1358,6 @@ def main():
         print(f"  Recall                    : {detection_results['recall']:.4f}")
         print(f"  F1-score                  : {detection_results['f1_score']:.4f}")
         print(f"  Found rate (IoU>0.5)      : {detection_results['found_rate']*100:.1f}%")
-
 
 if __name__ == "__main__":
     main()

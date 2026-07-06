@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-from .replay_buffer import ReplayBuffer
+from .replay_buffer import ReplayBuffer, PrioritizedReplayBuffer
 from .environment_refine import ROIRefinementEnv
 
 
@@ -72,7 +72,9 @@ class ROIRefinementAgent:
 
         self.eps       = rl.get("epsilon_start", 1.0)
         self.eps_end   = rl.get("epsilon_end", 0.05)
-        self.eps_decay = rl.get("epsilon_decay", 200)
+        # OTTIMIZZAZIONE: decadimento dedicato per il refiner (invece di
+        # ereditare sempre epsilon_decay condiviso col finder).
+        self.eps_decay = rl.get("refine_epsilon_decay", rl.get("epsilon_decay", 200))
 
         state_dim  = ROIRefinementEnv.STATE_DIM
         hidden_dim = rl.get("hidden_dim", 128)
@@ -84,7 +86,18 @@ class ROIRefinementAgent:
         self.optimizer = torch.optim.Adam(
             self.online.parameters(), lr=rl.get("lr", 1e-4)
         )
-        self.buffer = ReplayBuffer(rl.get("replay_buffer_size", 5000))
+        # OTTIMIZZAZIONE: Prioritized Experience Replay opzionale (stessa logica
+        # usata in agent_roi.py, vedi li' per la motivazione dettagliata).
+        self.use_per = bool(rl.get("use_prioritized_replay", False))
+        self.per_alpha = float(rl.get("per_alpha", 0.6))
+        self.per_beta_start = float(rl.get("per_beta_start", 0.4))
+        self.per_beta_frames = float(rl.get("per_beta_frames", 20000))
+        self._learn_steps = 0
+        buf_size = rl.get("replay_buffer_size", 5000)
+        if self.use_per:
+            self.buffer = PrioritizedReplayBuffer(buf_size, alpha=self.per_alpha)
+        else:
+            self.buffer = ReplayBuffer(buf_size)
 
         self._episode = 0
         self.checkpoint_dir = cfg["output"]["checkpoint_dir"]
@@ -137,7 +150,17 @@ class ROIRefinementAgent:
         if not self.buffer.is_ready(self.batch_size):
             return None
 
-        states, actions, rewards, next_states, dones = self.buffer.sample(self.batch_size)
+        if self.use_per:
+            self._learn_steps += 1
+            beta = min(1.0, self.per_beta_start + self._learn_steps *
+                       (1.0 - self.per_beta_start) / max(1.0, self.per_beta_frames))
+            states, actions, rewards, next_states, dones, indices, is_weights = \
+                self.buffer.sample(self.batch_size, beta=beta)
+            w = torch.from_numpy(is_weights).float().to(self.device)
+        else:
+            states, actions, rewards, next_states, dones = self.buffer.sample(self.batch_size)
+            w = None
+
         s  = torch.FloatTensor(states).to(self.device)
         a  = torch.LongTensor(actions).to(self.device)
         r  = torch.FloatTensor(rewards).to(self.device)
@@ -150,12 +173,21 @@ class ROIRefinementAgent:
             q_target = r + self.gamma * q_next * (1 - d)
 
         q_online = self.online(s).gather(1, a.unsqueeze(1)).squeeze(1)
-        loss = F.smooth_l1_loss(q_online, q_target)
+
+        td_errors = (q_online - q_target).detach()
+        elementwise_loss = F.smooth_l1_loss(q_online, q_target, reduction="none")
+        if w is not None:
+            loss = (elementwise_loss * w).mean()
+        else:
+            loss = elementwise_loss.mean()
 
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.online.parameters(), 1.0)
         self.optimizer.step()
+
+        if self.use_per:
+            self.buffer.update_priorities(indices, td_errors.cpu().numpy())
 
         return loss.item()
 

@@ -4,102 +4,95 @@ environment_roi.py — RL Environment per ROI Finding (Agent 1).
 L'agente impara a spostare e ridimensionare un bounding box
 per localizzare la regione di interesse (tumore) nell'immagine.
 
-Stato: vettore di feature compatto [img_features | box_features | overlap_features]
-Azioni (9):
-  0 = stop
-  1 = sposta su
-  2 = sposta giù
-  3 = sposta sinistra
-  4 = sposta destra
-  5 = allarga (espandi box)
-  6 = stringi (riduci box)
-  7 = allarga orizzontalmente
-  8 = allarga verticalmente
+STATO (CNN, NON più un vettore di feature):
+  Tensore [2, S, S] dove S = cfg["rl"]["roi_cnn_size"] (default 48):
+    - canale 0: immagine in scala di grigi ridimensionata a S×S, normalizzata [0,1]
+                (calcolata UNA SOLA VOLTA in reset() e messa in cache → ogni
+                step() costa solo il ridisegno del box, non un resize
+                dell'immagine intera: ottimizzazione chiave per la velocità)
+    - canale 1: maschera binaria del box corrente, renderizzata sulla griglia S×S
 
-Reward: ΔIOU_con_gt_box + bonus_terminale − penalità_passo
+In questo modo la Q-network (vedi agent_roi.py) è una CNN che osserva
+direttamente "dove si trova il box rispetto al contenuto dell'immagine",
+al posto delle 20 feature scalari estratte a mano della versione precedente.
+
+Azioni (17):
+  0  = stop
+  1  = sposta su (entrambi i lati Y)
+  2  = sposta giù
+  3  = sposta sinistra (entrambi i lati X)
+  4  = sposta destra
+  5  = allarga (espandi box su tutti i lati)
+  6  = stringi (riduci box su tutti i lati)
+  7  = allarga orizzontalmente (entrambi i lati X)
+  8  = allarga verticalmente (entrambi i lati Y)
+  9  = lato sinistro dentro  (x1 += step)
+  10 = lato sinistro fuori   (x1 -= step)
+  11 = lato destro dentro    (x2 -= step)
+  12 = lato destro fuori     (x2 += step)
+  13 = lato superiore dentro (y1 += step)
+  14 = lato superiore fuori  (y1 -= step)
+  15 = lato inferiore dentro (y2 -= step)
+  16 = lato inferiore fuori  (y2 += step)
+
+  Le azioni 9-16 muovono UN SOLO lato per volta: permettono di adattare la
+  forma/posizione del box a tumori non centrati o non quadrati senza dover
+  passare per combinazioni indirette di move+resize simmetrici.
+
+STEP SIZE ADATTIVO (coarse-to-fine):
+  Lo spostamento per singola azione non è più fisso per tutto l'episodio:
+  decresce a fasi (100% → 50% → 25% dello step base) man mano che
+  avanzano gli step. Le prime azioni servono per un posizionamento grezzo
+  veloce, le ultime per una convergenza fine — evita l'overshoot continuo
+  che uno step fisso da ~15px causava vicino al target.
+
+Reward: ΔIOU_con_gt_box + bonus_terminale − penalità_passo (costante)
 """
 import numpy as np
+import cv2
 from typing import Optional, Tuple, Dict
-from scipy import ndimage
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature extraction
+# Feature extraction (CNN state: immagine + box renderizzati su una griglia)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_roi_state(
-    image_np: np.ndarray,   # [H, W] or [H, W, C]
-    box: list,              # [x1, y1, x2, y2]
-    gt_box: list,           # [x1, y1, x2, y2] ground truth (solo in training)
-    img_size: int,
-) -> np.ndarray:
-    """
-    Estrae un vettore di stato compatto per il ROI Finder.
-    Dimensione: 6 (img_crop) + 6 (box_geo) + 4 (overlap) + 4 (gt_relative) = 20
-    """
-    if image_np.ndim == 3:
-        img_gray = image_np.mean(axis=-1)
+def _resize_gray_normalized(img_gray: np.ndarray, size: int) -> np.ndarray:
+    """Ridimensiona un'immagine [H,W] a [size,size] float32 normalizzata in [0,1]."""
+    out = cv2.resize(
+        img_gray.astype(np.float32), (size, size),
+        interpolation=cv2.INTER_AREA,
+    )
+    mn, mx = float(out.min()), float(out.max())
+    if mx > mn:
+        out = (out - mn) / (mx - mn)
     else:
-        img_gray = image_np.astype(np.float32)
+        out = np.zeros_like(out)
+    return out.astype(np.float32)
 
-    H, W = img_gray.shape
-    x1, y1, x2, y2 = [int(v) for v in box]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(W, x2), min(H, y2)
 
-    # --- Feature del crop interno al box (6)
-    if x2 > x1 and y2 > y1:
-        crop = img_gray[y1:y2, x1:x2]
-        crop_feats = np.array([
-            crop.mean(),
-            crop.std(),
-            crop.max(),
-            np.percentile(crop, 25),
-            np.percentile(crop, 75),
-            float(crop.size) / (H * W),  # area relativa
-        ], dtype=np.float32)
-    else:
-        crop_feats = np.zeros(6, dtype=np.float32)
+def _box_to_grid(box: list, img_size: int, grid_size: int) -> np.ndarray:
+    """Renderizza il box (coordinate in pixel immagine) come maschera binaria su una griglia grid_size×grid_size."""
+    scale = grid_size / float(img_size)
+    x1, y1, x2, y2 = box
+    gx1 = int(np.clip(round(x1 * scale), 0, grid_size))
+    gy1 = int(np.clip(round(y1 * scale), 0, grid_size))
+    gx2 = int(np.clip(round(x2 * scale), gx1 + 1, grid_size))
+    gy2 = int(np.clip(round(y2 * scale), gy1 + 1, grid_size))
+    grid = np.zeros((grid_size, grid_size), dtype=np.float32)
+    grid[gy1:gy2, gx1:gx2] = 1.0
+    return grid
 
-    # --- Feature geometriche del box (normalizzate su img_size) (6)
-    bw = (x2 - x1) / img_size
-    bh = (y2 - y1) / img_size
-    cx = ((x1 + x2) / 2) / img_size
-    cy = ((y1 + y2) / 2) / img_size
-    box_feats = np.array([
-        cx, cy,
-        bw, bh,
-        bw * bh,           # area
-        bw / (bh + 1e-6),  # aspect ratio
-    ], dtype=np.float32)
 
-    # --- Feature overlap con gt_box (4)
-    gx1, gy1, gx2, gy2 = [int(v) for v in gt_box]
-    ix1, iy1 = max(x1, gx1), max(y1, gy1)
-    ix2, iy2 = min(x2, gx2), min(y2, gy2)
-    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-    area_box = max((x2 - x1) * (y2 - y1), 1)
-    area_gt  = max((gx2 - gx1) * (gy2 - gy1), 1)
-    union = area_box + area_gt - inter
-    iou = inter / (union + 1e-6)
-    overlap_feats = np.array([
-        iou,
-        inter / (area_box + 1e-6),   # recall del box
-        inter / (area_gt + 1e-6),    # precision del box
-        float(inter > 0),            # flag overlap binario
-    ], dtype=np.float32)
-
-    # --- Posizione relativa del centro box rispetto a gt_box (4)
-    gcx = ((gx1 + gx2) / 2) / img_size
-    gcy = ((gy1 + gy2) / 2) / img_size
-    rel_feats = np.array([
-        cx - gcx,              # delta centro x
-        cy - gcy,              # delta centro y
-        bw - (gx2 - gx1) / img_size,  # delta width
-        bh - (gy2 - gy1) / img_size,  # delta height
-    ], dtype=np.float32)
-
-    return np.concatenate([crop_feats, box_feats, overlap_feats, rel_feats]).astype(np.float32)
+def _gradient_magnitude_normalized(img_gray_small: np.ndarray) -> np.ndarray:
+    """Canale extra di bordo/gradiente (Sobel), calcolato una sola volta per reset."""
+    gx = cv2.Sobel(img_gray_small, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(img_gray_small, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.hypot(gx, gy)
+    mx = float(mag.max())
+    if mx > 1e-6:
+        mag = mag / mx
+    return mag.astype(np.float32)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -110,14 +103,19 @@ class ROIFinderEnv:
     """
     Ambiente RL per trovare la ROI (bounding box) attorno al tumore.
 
-    L'agente sposta e ridimensiona un box finché non coverge sulla ROI reale
+    L'agente sposta e ridimensiona un box finché non converge sulla ROI reale
     o raggiunge il limite di step.
 
     Usato come Agent 1 nel pipeline doppio RL.
+
+    Lo stato restituito (vedi _get_state) è ora un'immagine a 2 canali
+    (immagine + maschera del box), pensata per essere consumata da una
+    Q-network convoluzionale (DuelingCNN in agent_roi.py) al posto del
+    precedente vettore di 20 feature scalari.
     """
 
-    NUM_ACTIONS = 9
-    STATE_DIM   = 20  # 6 crop + 6 box_geo + 4 overlap + 4 gt_rel
+    NUM_ACTIONS     = 17
+    STATE_CHANNELS  = 2     # canale immagine + canale box
 
     def __init__(self, cfg: dict):
         rl = cfg.get("rl", {})
@@ -129,27 +127,52 @@ class ROIFinderEnv:
         else:
             self.img_size = int(img_size_cfg)
 
-        self.step_size   = max(8, int(self.img_size * 0.06))
+        # Risoluzione spaziale dello stato CNN (piccola apposta per la velocità:
+        # un forward CNN su 48×48 è enormemente più economico che su 256×256,
+        # e per il task di localizzazione non serve dettaglio fine).
+        self.cnn_size = int(rl.get("roi_cnn_size", 48))
+
+        # OTTIMIZZAZIONE: canali stato configurabili (2 o 3, con gradiente extra)
+        self.state_channels = int(rl.get("roi_state_channels", self.STATE_CHANNELS))
+
+        # OTTIMIZZAZIONE: box iniziale randomizzato in training (rompe il bias
+        # "tumore sempre al centro" del box fisso originale)
+        self.random_init = bool(rl.get("roi_random_init", False))
+        scale_range = rl.get("roi_random_init_scale_range", [0.25, 0.6])
+        self.random_init_scale_min = float(scale_range[0])
+        self.random_init_scale_max = float(scale_range[1])
+        self.random_init_jitter = float(rl.get("roi_random_init_center_jitter", 0.3))
+
+        # Step size adattivo: base_step è il valore di partenza (fase coarse),
+        # min_step è il pavimento della fase fine. Vedi _current_step_size().
+        self.base_step   = max(8, int(self.img_size * 0.06))
+        self.min_step    = max(2, self.base_step // 4)
         self.max_steps   = rl.get("roi_max_steps", 100)
         self.step_pen    = rl.get("roi_step_penalty", 0.01)
         self.w_terminal  = rl.get("roi_terminal_weight", 3.0)
 
         # Stato interno
-        self.image_np  : Optional[np.ndarray] = None
-        self.gt_mask_np: Optional[np.ndarray] = None
-        self.gt_box    : list = [0, 0, self.img_size, self.img_size]
-        self.box       : list = [0, 0, self.img_size, self.img_size]
-        self.prev_iou  : float = 0.0
-        self.step_count: int   = 0
-        
+        self.image_np   : Optional[np.ndarray] = None
+        self.gt_mask_np : Optional[np.ndarray] = None
+        self.gt_box     : list = [0, 0, self.img_size, self.img_size]
+        self.box        : list = [0, 0, self.img_size, self.img_size]
+        self.prev_iou   : float = 0.0
+        self.step_count : int   = 0
+
+        # Cache: immagine ridimensionata calcolata una sola volta per reset()
+        self._img_small : Optional[np.ndarray] = None
+        self._grad_small: Optional[np.ndarray] = None
 
     # ── Reset ─────────────────────────────────────────────────────────────────
 
-    def reset(self, image: np.ndarray, gt_mask: np.ndarray) -> np.ndarray:
+    def reset(self, image: np.ndarray, gt_mask: np.ndarray, randomize: bool = False) -> np.ndarray:
         """
         Resetta l'ambiente per una nuova immagine.
-        image:   [H,W] o [H,W,C] float32
-        gt_mask: [H,W] binaria float32
+        image:     [H,W] o [H,W,C] float32
+        gt_mask:   [H,W] binaria float32
+        randomize: se True (training) e roi_random_init e' abilitato in config,
+                   il box iniziale viene campionato casualmente invece di
+                   essere sempre centrato. In eval va lasciato False.
         """
         if image.ndim == 3 and image.shape[0] in (1, 3):
             # Da [C,H,W] a [H,W,C]
@@ -162,6 +185,14 @@ class ROIFinderEnv:
         self.image_np   = img_gray.astype(np.float32)
         self.gt_mask_np = gt_mask.astype(np.float32)
 
+        # Ottimizzazione: il resize dell'immagine è il pezzo più costoso della
+        # costruzione dello stato CNN → lo facciamo una volta sola qui, e lo
+        # riusiamo identico per tutti gli step dell'episodio (cambia solo il
+        # box, che è economico da renderizzare).
+        self._img_small = _resize_gray_normalized(self.image_np, self.cnn_size)
+        if self.state_channels >= 3:
+            self._grad_small = _gradient_magnitude_normalized(self._img_small)
+
         # Calcola gt_box dal mask
         ys, xs = np.where(gt_mask > 0.5)
         if len(ys) > 0:
@@ -172,64 +203,94 @@ class ROIFinderEnv:
         else:
             self.gt_box = [0, 0, self.img_size, self.img_size]
 
-        # Box iniziale: centro dell'immagine, dimensione media
-        m = self.img_size // 4
-        self.box = [m, m, self.img_size - m, self.img_size - m]
+        # Box iniziale: centro dell'immagine, dimensione media (default),
+        # oppure campionato casualmente se randomize=True (vedi docstring).
+        if randomize and self.random_init:
+            self.box = self._sample_random_box()
+        else:
+            m = self.img_size // 4
+            self.box = [m, m, self.img_size - m, self.img_size - m]
         self.prev_iou   = self._iou(self.box, self.gt_box)
         self.step_count = 0
-        
-        x1, y1, x2, y2 = self.box
-        cx = (x1 + x2) / 2
-        cy = (y1 + y2) / 2
-        gx1, gy1, gx2, gy2 = self.gt_box
-        gcx = (gx1 + gx2) / 2
-        gcy = (gy1 + gy2) / 2
-
-        # 1. Errore Centroidi (normalizzato per dimensione immagine)
-        dist_x = abs(cx - gcx) / self.img_size
-        dist_y = abs(cy - gcy) / self.img_size
-        centroid_err = (dist_x + dist_y) / 2
-        
-        # 2. Errore Dimensioni (normalizzato per dimensioni GT)
-        bw = max(x2 - x1, 1)
-        bh = max(y2 - y1, 1)
-        gbw = max(gx2 - gx1, 1)
-        gbh = max(gy2 - gy1, 1)
-        
-        size_err = (abs(bw - gbw) / gbw + abs(bh - gbh) / gbh) / 2
-        
-        # Combinazione degli errori (0 = perfetto, >0 = errore)
-        # Puoi dare pesi diversi se necessario
-        self.prev_total_err = (0.5 * centroid_err + 0.5 * size_err)
 
         return self._get_state()
 
+    # ── Random init ──────────────────────────────────────────────────────────
+
+    def _sample_random_box(self) -> list:
+        """Campiona un box iniziale casuale (scala + posizione) al posto del box fisso centrato."""
+        scale = np.random.uniform(self.random_init_scale_min, self.random_init_scale_max)
+        w = h = max(20, int(self.img_size * scale))
+
+        jitter = self.random_init_jitter * self.img_size
+        cx = self.img_size / 2.0 + np.random.uniform(-jitter, jitter)
+        cy = self.img_size / 2.0 + np.random.uniform(-jitter, jitter)
+
+        x1 = int(np.clip(cx - w / 2, 0, self.img_size - 20))
+        y1 = int(np.clip(cy - h / 2, 0, self.img_size - 20))
+        x2 = int(np.clip(x1 + w, x1 + 20, self.img_size))
+        y2 = int(np.clip(y1 + h, y1 + 20, self.img_size))
+        return [x1, y1, x2, y2]
+
     # ── Step ──────────────────────────────────────────────────────────────────
+
+    def _current_step_size(self) -> int:
+        """
+        Schedule coarse-to-fine: step size grande nei primi step (ricerca
+        veloce e grossolana), poi via via più piccolo per permettere una
+        convergenza fine senza overshoot continuo.
+          [0%, 40%)  del episodio → step base (100%)
+          [40%, 75%) del episodio → step/2
+          [75%, 100%] del episodio → step/4 (mai sotto min_step)
+        """
+        frac = self.step_count / max(1, self.max_steps)
+        if frac < 0.40:
+            return self.base_step
+        elif frac < 0.75:
+            return max(self.min_step, self.base_step // 2)
+        else:
+            return max(self.min_step, self.base_step // 4)
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict]:
         """Applica un'azione e restituisce (stato, reward, done, info)."""
         done = False
-        s = self.step_size
+        s = self._current_step_size()
         x1, y1, x2, y2 = self.box
 
-        if action == 0:   # stop
+        if action == 0:    # stop
             done = True
-        elif action == 1: # su
+        elif action == 1:  # su (entrambi i lati Y)
             y1 -= s; y2 -= s
-        elif action == 2: # giù
+        elif action == 2:  # giù
             y1 += s; y2 += s
-        elif action == 3: # sinistra
+        elif action == 3:  # sinistra (entrambi i lati X)
             x1 -= s; x2 -= s
-        elif action == 4: # destra
+        elif action == 4:  # destra
             x1 += s; x2 += s
-        elif action == 5: # allarga tutto
+        elif action == 5:  # allarga tutto
             x1 -= s; y1 -= s; x2 += s; y2 += s
-        elif action == 6: # stringi tutto
+        elif action == 6:  # stringi tutto
             x1 += s; y1 += s; x2 -= s; y2 -= s
-        elif action == 7: # allarga orizzontale
+        elif action == 7:  # allarga orizzontale
             x1 -= s; x2 += s
-        elif action == 8: # allarga verticale
+        elif action == 8:  # allarga verticale
             y1 -= s; y2 += s
+        elif action == 9:  # lato sinistro dentro
+            x1 += s
+        elif action == 10: # lato sinistro fuori
+            x1 -= s
+        elif action == 11: # lato destro dentro
+            x2 -= s
+        elif action == 12: # lato destro fuori
+            x2 += s
+        elif action == 13: # lato superiore dentro
+            y1 += s
+        elif action == 14: # lato superiore fuori
+            y1 -= s
+        elif action == 15: # lato inferiore dentro
+            y2 -= s
+        elif action == 16: # lato inferiore fuori
+            y2 += s
 
         # Clipping e min size
         x1 = int(np.clip(x1, 0, self.img_size - 20))
@@ -238,39 +299,18 @@ class ROIFinderEnv:
         y2 = int(np.clip(y2, y1 + 20, self.img_size))
         self.box = [x1, y1, x2, y2]
 
-        # Reward
+        # Reward: variazione diretta di IoU rispetto al box GT (coerente
+        # con il docstring della classe), non più un proxy basato su
+        # errore di centroide/dimensione. Questo allinea il segnale di
+        # apprendimento per-step alla metrica che vogliamo massimizzare.
         new_iou = self._iou(self.box, self.gt_box)
-        cx = (x1 + x2) / 2
-        cy = (y1 + y2) / 2
-        gx1, gy1, gx2, gy2 = self.gt_box
-        gcx = (gx1 + gx2) / 2
-        gcy = (gy1 + gy2) / 2
 
-        # 1. Errore Centroidi (normalizzato per dimensione immagine)
-        dist_x = abs(cx - gcx) / self.img_size
-        dist_y = abs(cy - gcy) / self.img_size
-        centroid_err = (dist_x + dist_y) / 2
-        
-        # 2. Errore Dimensioni (normalizzato per dimensioni GT)
-        bw = max(x2 - x1, 1)
-        bh = max(y2 - y1, 1)
-        gbw = max(gx2 - gx1, 1)
-        gbh = max(gy2 - gy1, 1)
-        
-        size_err = (abs(bw - gbw) / gbw + abs(bh - gbh) / gbh) / 2
-        
-        # Combinazione degli errori (0 = perfetto, >0 = errore)
-        # Puoi dare pesi diversi se necessario
-        total_err = (0.5 * centroid_err + 0.5 * size_err)
-        
-        # Reward basata sulla riduzione dell'errore (Delta)
-        # Se total_err diminuisce, la reward è positiva
-        current_score = 1.0 - total_err
-        prev_score = 1.0 - self.prev_total_err # Devi aggiungere self.prev_total_err nel reset
-        
-        reward = (current_score - prev_score) * 10.0 - self.step_pen * self.step_count
-        
-        self.prev_total_err = total_err
+        # Reward shaping: ΔIoU scalata, penalità di step COSTANTE (non più
+        # proporzionale a step_count, per non incentivare uno stop prematuro
+        # negli episodi lunghi).
+        reward = (new_iou - self.prev_iou) * 10.0 - self.step_pen
+
+        self.prev_iou = new_iou
         self.step_count += 1
         if self.step_count >= self.max_steps:
             done = True
@@ -309,7 +349,15 @@ class ROIFinderEnv:
         return crop, self.box
 
     def _get_state(self) -> np.ndarray:
-        return extract_roi_state(self.image_np, self.box, self.gt_box, self.img_size)
+        """
+        Stato CNN: tensore [2, cnn_size, cnn_size].
+          canale 0 = immagine (cache, calcolata una sola volta in reset)
+          canale 1 = box corrente renderizzato sulla griglia
+        """
+        box_grid = _box_to_grid(self.box, self.img_size, self.cnn_size)
+        if self.state_channels >= 3 and self._grad_small is not None:
+            return np.stack([self._img_small, box_grid, self._grad_small], axis=0).astype(np.float32)
+        return np.stack([self._img_small, box_grid], axis=0).astype(np.float32)
 
     @staticmethod
     def _iou(bA: list, bB: list) -> float:

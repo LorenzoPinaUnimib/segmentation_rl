@@ -22,19 +22,23 @@ import torch
 from stable_baselines3.common.callbacks import BaseCallback
 
 from config import N_ACTIONS
-from utils import build_coord_planes
+from utils import build_box_vec
 
 
 class VisionMetricsCallback(BaseCallback):
     """Logga le componenti di reward/IoU su TensorBoard e salva una GradCAM
     periodica su un campione fisso, per capire dove guarda la CNN."""
 
-    def __init__(self, val_dataset, verbose=0, save_dir="./ppo_gradcam_outputs", gradcam_every=20):
+    def __init__(self, val_dataset, verbose=0, save_dir="./ppo_gradcam_outputs", gradcam_every=20, continuous=False):
         super().__init__(verbose)
         self.val_dataset = val_dataset
         self.save_dir = save_dir
         self.gradcam_every = gradcam_every
         self.iteration_count = 0
+        # FIX v7: con action space continuo non esistono "conteggi di azioni
+        # discrete" ne' action_masks -- disattiva quella parte della GradCAM/
+        # logging invece di farla fallire silenziosamente su tipi sbagliati.
+        self.continuous = continuous
         os.makedirs(self.save_dir, exist_ok=True)
 
         self.action_counts = np.zeros(N_ACTIONS, dtype=np.int64)
@@ -76,12 +80,13 @@ class VisionMetricsCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos")
-        actions = self.locals.get("actions")
-        if actions is not None:
-            for a in np.atleast_1d(actions):
-                a = int(a)
-                if 0 <= a < N_ACTIONS:
-                    self.action_counts[a] += 1
+        if not self.continuous:
+            actions = self.locals.get("actions")
+            if actions is not None:
+                for a in np.atleast_1d(actions):
+                    a = int(a)
+                    if 0 <= a < N_ACTIONS:
+                        self.action_counts[a] += 1
 
         if infos:
             delta_vals, dist_vals, total_vals, oversize_vals, oscillation_vals = [], [], [], [], []
@@ -113,7 +118,7 @@ class VisionMetricsCallback(BaseCallback):
                 self.logger.record("custom_plots/1_iou_final", float(np.mean(final_vals)))
                 self.logger.record("custom_plots/1_success_rate", float(np.mean(np.array(final_vals) >= 0.5)))
 
-        if self.action_counts.sum() > 0 and self.num_timesteps % 50_000 < self.training_env.num_envs:
+        if not self.continuous and self.action_counts.sum() > 0 and self.num_timesteps % 50_000 < self.training_env.num_envs:
             freqs = self.action_counts / max(1, self.action_counts.sum())
             for a in range(N_ACTIONS):
                 self.logger.record(f"action_distribution/action_{a}", float(freqs[a]))
@@ -126,6 +131,16 @@ class VisionMetricsCallback(BaseCallback):
             self.generate_and_save_gradcam()
 
     def generate_and_save_gradcam(self):
+        # FIX v7 (SAC/continuo): questa GradCAM usa model.policy.features_extractor
+        # (unificato) e model.policy.predict_values, entrambi specifici di
+        # ActorCriticPolicy (PPO). SACPolicy non ha un features_extractor unico
+        # a livello di policy (ce l'hanno separatamente .actor e .critic) ne'
+        # un metodo predict_values -> AttributeError certo al primo rollout se
+        # non si esce subito qui. self.continuous era gia' salvato ma mai
+        # controllato PRIMA di toccare model.policy: va guardato qui, non solo
+        # piu' sotto nella logica di spostamento del box.
+        if self.continuous:
+            return
         box_mask = np.zeros((self.H, self.W), dtype=np.uint8)
         cx, cy, w, h = self.fixed_initial_box
         x1, y1 = int(cx - w / 2.0), int(cy - h / 2.0)
@@ -134,9 +149,16 @@ class VisionMetricsCallback(BaseCallback):
         box_mask_channel = np.expand_dims(box_mask, axis=0)
 
         img_uint8 = (self.fixed_sample["image"].numpy() * 255).astype(np.uint8)
-        coord_planes = build_coord_planes(cx, cy, w, h, self.W, self.H)
-        fixed_obs = np.concatenate([img_uint8, box_mask_channel, coord_planes], axis=0)
-        obs_tensor = torch.tensor(np.expand_dims(fixed_obs, axis=0), dtype=torch.float32).to(self.model.device)
+        # FIX (Dict observation space): l'osservazione e' ora {"image":...,
+        # "box_vec":...} invece di un array unico concatenato con i piani di
+        # coordinate -- si costruiscono due tensori separati, uno per chiave,
+        # esattamente come farebbe model.predict() internamente.
+        image_obs = np.concatenate([img_uint8, box_mask_channel], axis=0)
+        box_vec = build_box_vec(cx, cy, w, h, self.W, self.H)
+        fixed_obs = {"image": image_obs, "box_vec": box_vec}
+        image_tensor = torch.tensor(np.expand_dims(image_obs, axis=0), dtype=torch.float32).to(self.model.device)
+        box_vec_tensor = torch.tensor(np.expand_dims(box_vec, axis=0), dtype=torch.float32).to(self.model.device)
+        obs_tensor = {"image": image_tensor, "box_vec": box_vec_tensor}
 
         with torch.enable_grad():
             self.model.policy.eval()
@@ -145,7 +167,13 @@ class VisionMetricsCallback(BaseCallback):
             def forward_hook(module, inp, out): nonlocal activations; activations = out
             def backward_hook(module, gin, gout): nonlocal gradients; gradients = gout[0]
 
-            target_layer = self.model.policy.features_extractor.cnn[4]
+            # FIX (Dict obs -> MultiInputPolicy): con Dict observation space
+            # SB3 usa un CombinedExtractor che tiene un sotto-estrattore per
+            # chiave in .extractors (ModuleDict): "image" -> NatureCNN (che a
+            # sua volta espone .cnn), "box_vec" -> Flatten. Prima (Box
+            # observation space unico) il path era semplicemente
+            # policy.features_extractor.cnn[4].
+            target_layer = self.model.policy.features_extractor.extractors["image"].cnn[4]
             h1 = target_layer.register_forward_hook(forward_hook)
             h2 = target_layer.register_full_backward_hook(backward_hook)
 
@@ -181,6 +209,8 @@ class VisionMetricsCallback(BaseCallback):
         gt = self.fixed_gt_box
         cv2.rectangle(overlay, (int(gt[0]), int(gt[1])), (int(gt[0] + gt[2]), int(gt[1] + gt[3])), (0, 255, 0), 2)
 
+        # (self.continuous e' gia' escluso dall'early-return in cima alla
+        # funzione, quindi qui siamo sempre nel ramo discreto/PPO.)
         mask = self._compute_mask_for_fixed_box()
         with torch.no_grad():
             action, _ = self.model.predict(fixed_obs, deterministic=True, action_masks=mask)
@@ -355,14 +385,39 @@ class AdaptiveCurriculumCallback(BaseCallback):
         step senza ne' avanzare ne' regredire, scatta comunque un reheat
         periodico ("nuovo tentativo" con piu' esplorazione) -- questo e' il fix
         del bug: il reheat si ripete SEMPRE, anche all'ultimo stage.
+
+    FIX v5 (flapping): con il warm-start del localizzatore gli episodi
+    finiscono molto piu' in fretta, quindi un buffer piccolo (window=100) si
+    riempiva in pochissimi step, molto prima del vecchio min_steps_per_stage
+    (30_000). Siccome ad ogni transizione il buffer viene svuotato, e subito
+    dopo una REGRESSIONE il success_rate schizza in alto meccanicamente (il
+    task e' improvvisamente piu' facile, non perche' si sia imparato di piu'),
+    il sistema poteva riavanzare quasi subito, creando un ping-pong perenne tra
+    due stage senza mai consolidare -- e ogni transizione riaccendeva il reheat
+    di ent_coef, impedendogli di scendere mai al pavimento. window e
+    min_steps_per_stage sono stati alzati di netto (300 episodi / 150_000 step)
+    apposta per dare tempo alle statistiche di assestarsi prima di decidere.
+
+    FIX v6 (avanzamento troppo permissivo): risolto il flapping, e' emerso un
+    problema diverso -- il curriculum avanzava esattamente ogni min_steps_per_stage
+    (150_000), ad OGNI transizione, perche' advance_threshold=0.35 veniva quasi
+    sempre soddisfatto appena scadeva il tempo minimo, non perche' l'agente
+    avesse davvero consolidato lo stage. Di fatto un curriculum "adattivo" con
+    una soglia troppo permissiva si comporta come un curriculum a tempo fisso
+    con periodo 150k: la difficolta' saliva piu' in fretta della vera qualita'
+    (IoU assoluta in calo strutturale ad ogni stage, vedi custom_plots/1_iou_final).
+    advance_threshold e regress_threshold sono stati alzati per richiedere vera
+    padronanza prima di avanzare, e per intercettare il logoramento (che prima
+    non veniva mai rilevato perche' restava sempre sopra il vecchio regress_threshold
+    troppo basso).
     """
 
     def __init__(self, n_stages=6, initial_difficulty=0.0, final_difficulty=1.0,
-                 window=100, min_steps_per_stage=30_000, advance_threshold=0.35,
-                 regress_threshold=0.08, stall_patience=150_000,
+                 window=300, min_steps_per_stage=250_000, advance_threshold=0.55,
+                 regress_threshold=0.20, stall_patience=300_000,
                  reheat_ent=0.03, floor_ent=0.01,
                  reheat_step_frac=0.05, floor_step_frac=0.012,
-                 reheat_duration=60_000, verbose=1):
+                 reheat_duration=60_000, manage_entropy=True, verbose=1):
         super().__init__(verbose)
         self.n_stages = max(1, n_stages)
         self.difficulties = ([initial_difficulty + (final_difficulty - initial_difficulty) * i / (self.n_stages - 1)
@@ -375,6 +430,13 @@ class AdaptiveCurriculumCallback(BaseCallback):
         self.reheat_ent, self.floor_ent = reheat_ent, floor_ent
         self.reheat_step_frac, self.floor_step_frac = reheat_step_frac, floor_step_frac
         self.reheat_duration = reheat_duration
+        # FIX v7 (SAC/continuo): SAC ha una propria auto-regolazione
+        # dell'entropia (ent_coef="auto", target_entropy interno) -- scriverci
+        # sopra un valore fisso da qui non avrebbe l'effetto voluto (e con SAC
+        # l'attributo giusto non e' nemmeno un semplice float come in PPO).
+        # manage_entropy=False disattiva solo il controllo di ent_coef, lasciando
+        # intatta la gestione di difficolta'/step_frac (che serve comunque).
+        self.manage_entropy = manage_entropy
 
         self.stage = 0
         self._iou_final_buffer = deque(maxlen=window)
@@ -421,14 +483,18 @@ class AdaptiveCurriculumCallback(BaseCallback):
         # sawtooth ent_coef / step_frac dal reheat piu' recente (transizione o stallo)
         step_since_reheat = self.num_timesteps - self._last_reheat_step
         frac = min(1.0, step_since_reheat / max(1, self.reheat_duration))
-        ent = self.reheat_ent + frac * (self.floor_ent - self.reheat_ent)
         step_frac = self.reheat_step_frac + frac * (self.floor_step_frac - self.reheat_step_frac)
-        self.model.ent_coef = ent
         self.training_env.env_method("set_step_frac", step_frac)
 
-        if self.num_timesteps % 50_000 < self.training_env.num_envs:
+        ent = None
+        if self.manage_entropy:
+            ent = self.reheat_ent + frac * (self.floor_ent - self.reheat_ent)
+            self.model.ent_coef = ent
+
+        if self.num_timesteps % 5_000 < self.training_env.num_envs:
             self.logger.record("custom_plots/9_init_difficulty", float(self.difficulties[self.stage]))
-            self.logger.record("custom_plots/6_ent_coef", float(ent))
+            if ent is not None:
+                self.logger.record("custom_plots/6_ent_coef", float(ent))
             self.logger.record("custom_plots/8_step_frac", float(step_frac))
             if success_rate is not None:
                 self.logger.record("custom_plots/10_curriculum_success_rate", success_rate)

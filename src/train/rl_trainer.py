@@ -19,6 +19,7 @@ Parametri aggiuntivi nel config.yaml (tutti opzionali, con default):
     reward_smooth_window: 20        # finestra media mobile reward
 """
 import os
+import time
 import collections
 import numpy as np
 import torch
@@ -69,25 +70,37 @@ class EpisodeRewardBuffer:
 def make_prob_map_adaptive(crop_gray: np.ndarray) -> np.ndarray:
     """
     Genera una mappa di probabilità senza U-Net usando:
-    1. Normalizzazione locale
-    2. Sogliatura adattiva basata su intensità + gradiente
+    1. Normalizzazione locale + CLAHE (equalizzazione a contrasto limitato)
+    2. Sogliatura adattiva basata su intensità (post-CLAHE) + gradiente
     3. Smoothing gaussiano → valori in [0,1]
 
-    Funziona bene per immagini MRI dove il tumore è più luminoso
-    del tessuto circostante.
+    OTTIMIZZAZIONE: aggiunto un passo CLAHE prima del punteggio combinato.
+    La normalizzazione min-max globale da sola sovra/sotto-espone crop con
+    tumori a basso contrasto locale (comuni in MRI non-contrastate): CLAHE
+    rinforza il contrasto locale attorno al tumore senza amplificare troppo
+    il rumore di fondo, alzando il "tetto" di qualità raggiungibile da questa
+    baseline puramente classica (nessun training, nessuna U-Net).
     """
+    import cv2
+
     crop = crop_gray.astype(np.float32)
     crop_min, crop_max = crop.min(), crop.max()
     if crop_max > crop_min:
         crop = (crop - crop_min) / (crop_max - crop_min + 1e-8)
 
-    gx = ndimage.sobel(crop, axis=0)
-    gy = ndimage.sobel(crop, axis=1)
+    crop_u8 = np.clip(crop * 255.0, 0, 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    crop_eq = clahe.apply(crop_u8).astype(np.float32) / 255.0
+
+    gx = ndimage.sobel(crop_eq, axis=0)
+    gy = ndimage.sobel(crop_eq, axis=1)
     gradient = np.hypot(gx, gy)
     gradient = gradient / (gradient.max() + 1e-8)
 
-    score = 0.7 * crop + 0.3 * gradient
-    prob = ndimage.gaussian_filter(score, sigma=2.0)
+    # Combina intensita' originale (evita di seguire artefatti puri di CLAHE),
+    # intensita' equalizzata (contrasto locale) e gradiente (bordi).
+    score = 0.4 * crop + 0.35 * crop_eq + 0.25 * gradient
+    prob = ndimage.gaussian_filter(score, sigma=1.5)
     prob = np.clip(prob, 0, 1)
     return prob.astype(np.float32)
 
@@ -166,28 +179,38 @@ def _full_eval_finder(
     Restituisce IoU medio, std e mediana per una stima stabile.
     """
     ious: List[float] = []
+    samples = []
     for batch in loader:
         imgs    = batch["image"]
         targets = batch["mask"]
         for i in range(imgs.size(0)):
-            img_gray = _tensor_to_gray(imgs[i])
-            gt_mask  = _tensor_to_mask(targets[i])
-            state = env.reset(img_gray, gt_mask)
-            done = False
-            last_iou = 0.0
-            while not done:
-                action = agent.act(state, greedy=True)
-                state, _, done, info = env.step(action)
-                last_iou = info["iou"]
-            ious.append(last_iou)
+            samples.append((imgs[i], targets[i]))
+
+    t0 = time.time()
+    pbar = tqdm(samples, desc="  Eval (val)", unit="img", leave=False, dynamic_ncols=True)
+    for image_t, mask_t in pbar:
+        img_gray = _tensor_to_gray(image_t)
+        gt_mask  = _tensor_to_mask(mask_t)
+        state = env.reset(img_gray, gt_mask)
+        done = False
+        last_iou = 0.0
+        while not done:
+            action = agent.act(state, greedy=True)
+            state, _, done, info = env.step(action)
+            last_iou = info["iou"]
+        ious.append(last_iou)
+        pbar.set_postfix({"IoU": f"{np.mean(ious):.3f}"})
+    pbar.close()
+    elapsed = time.time() - t0
 
     if not ious:
-        return {"mean": 0.0, "std": 0.0, "median": 0.0, "n": 0}
+        return {"mean": 0.0, "std": 0.0, "median": 0.0, "n": 0, "time_sec": elapsed}
     return {
         "mean":   float(np.mean(ious)),
         "std":    float(np.std(ious)),
         "median": float(np.median(ious)),
         "n":      len(ious),
+        "time_sec": elapsed,
     }
 
 
@@ -350,7 +373,10 @@ class ROIFinderTrainer:
         img_gray = _tensor_to_gray(image_t)
         gt_mask  = _tensor_to_mask(mask_t)
 
-        state = self.env.reset(img_gray, gt_mask)
+        # OTTIMIZZAZIONE: box iniziale randomizzato SOLO in training (train=True).
+        # In eval (train=False) resta il box centrato deterministico, per una
+        # valutazione riproducibile e confrontabile tra checkpoint.
+        state = self.env.reset(img_gray, gt_mask, randomize=train)
         total_reward = 0.0
 
         while True:
@@ -376,23 +402,38 @@ class ROIFinderTrainer:
         """Valuta su TUTTE le immagini del val set."""
         return _full_eval_finder(self.agent, self.env, self.val_loader)
 
-    def _run_iteration(self, train: bool) -> Dict[str, float]:
+    def _run_iteration(self, train: bool, episode_num: int = 0) -> Dict[str, float]:
         """Un'iterazione = un passaggio su TUTTE le immagini del train set."""
         if not self._all_samples:
-            return {"reward": 0.0, "iou": 0.0}
+            return {"reward": 0.0, "iou": 0.0, "time_sec": 0.0}
 
         indices = np.random.permutation(len(self._all_samples))
         rewards, ious = [], []
 
-        for idx in indices:
+        t0 = time.time()
+        pbar = tqdm(
+            indices,
+            desc=f"  Iter {episode_num:04d}/{self.episodes}" if train else "  Iter (eval)",
+            unit="img",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        for idx in pbar:
             image_t, mask_t = self._all_samples[int(idx)]
             ep_info = self._run_episode(image_t, mask_t, train=train)
             rewards.append(ep_info["reward"])
             ious.append(ep_info["iou"])
+            pbar.set_postfix({
+                "R":   f"{np.mean(rewards):+.3f}",
+                "IoU": f"{np.mean(ious):.3f}",
+            })
+        pbar.close()
+        elapsed = time.time() - t0
 
         return {
-            "reward": float(np.mean(rewards)),
-            "iou":    float(np.mean(ious)),
+            "reward":   float(np.mean(rewards)),
+            "iou":      float(np.mean(ious)),
+            "time_sec": elapsed,
         }
 
     def train(self, eval_every: int = 20) -> Dict:
@@ -403,8 +444,10 @@ class ROIFinderTrainer:
             print(f" Validazione su TUTTO il val set ogni {eval_every} iterazioni")
         print(f"{'='*60}")
 
+        self.history.setdefault("iter_time_sec", [])
+
         for ep in range(1, self.episodes + 1):
-            ep_info = self._run_iteration(train=True)
+            ep_info = self._run_iteration(train=True, episode_num=ep)
 
             # Aggiorna buffer rolling
             self._reward_buf.push(ep_info["reward"])
@@ -415,6 +458,7 @@ class ROIFinderTrainer:
             self.history["iou"].append(ep_info["iou"])
             self.history["iou_smooth"].append(self._iou_buf.mean)
             self.history["epsilon"].append(self.agent.eps)
+            self.history["iter_time_sec"].append(ep_info["time_sec"])
 
             self.agent.update_epsilon()
             self.agent.maybe_sync_target()
@@ -427,12 +471,14 @@ class ROIFinderTrainer:
                     val_std    = stats["std"]
                     val_median = stats["median"]
                     n_eval     = stats["n"]
+                    eval_time  = stats.get("time_sec", 0.0)
                 else:
                     # Fallback: campione parziale (comportamento legacy)
                     val_mean   = self._validate_partial()
                     val_std    = 0.0
                     val_median = val_mean
                     n_eval     = -1
+                    eval_time  = 0.0
 
                 self.history["val_iou_mean"].append(val_mean)
                 self.history["val_iou_std"].append(val_std)
@@ -442,12 +488,23 @@ class ROIFinderTrainer:
                 n_str = f"n={n_eval}" if n_eval > 0 else "campione"
                 print(
                     f"Ep {ep:04d}/{self.episodes} | "
+                    f"tempo iter={ep_info['time_sec']:.1f}s | "
                     f"R={ep_info['reward']:+.3f} (μ{self._reward_buf.mean:+.3f}) | "
                     f"IoU={ep_info['iou']:.4f} (μ{self._iou_buf.mean:.4f}) | "
                     f"ε={self.agent.eps:.3f} | "
-                    f"Val IoU μ={val_mean:.4f} σ={val_std:.4f} med={val_median:.4f} [{n_str}]"
+                    f"Val IoU μ={val_mean:.4f} σ={val_std:.4f} med={val_median:.4f} "
+                    f"[{n_str}, {eval_time:.1f}s]"
+                )
+            else:
+                print(
+                    f"Ep {ep:04d}/{self.episodes} | "
+                    f"tempo iter={ep_info['time_sec']:.1f}s | "
+                    f"R={ep_info['reward']:+.3f} (μ{self._reward_buf.mean:+.3f}) | "
+                    f"IoU={ep_info['iou']:.4f} (μ{self._iou_buf.mean:.4f}) | "
+                    f"ε={self.agent.eps:.3f}"
                 )
 
+            if ep % eval_every == 0 or ep == 1:
                 # Salva best checkpoint in base al val IoU
                 if val_mean > self.best_val_iou:
                     self.best_val_iou = val_mean
@@ -637,28 +694,40 @@ class ROIRefinerTrainer:
             prob_method   = self.prob_method,
         )
 
-    def _run_iteration(self, train: bool) -> Dict[str, float]:
+    def _run_iteration(self, train: bool, episode_num: int = 0) -> Dict[str, float]:
         """Un'iterazione = un passaggio su TUTTE le immagini del train set."""
         if not self._all_samples:
-            return {"reward": 0.0, "dice_bl": 0.0, "dice_rl": 0.0, "delta": 0.0}
+            return {"reward": 0.0, "dice_bl": 0.0, "dice_rl": 0.0, "delta": 0.0, "time_sec": 0.0}
 
         indices = np.random.permutation(len(self._all_samples))
         rewards, dices_bl, dices_rl = [], [], []
 
-        for idx in indices:
+        t0 = time.time()
+        pbar = tqdm(
+            indices,
+            desc=f"  Iter {episode_num:04d}/{self.episodes}" if train else "  Iter (eval)",
+            unit="img",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        for idx in pbar:
             image_t, mask_t = self._all_samples[int(idx)]
             ep_info = self._run_episode(image_t, mask_t, train=train)
             rewards.append(ep_info["reward"])
             dices_bl.append(ep_info["dice_bl"])
             dices_rl.append(ep_info["dice_rl"])
+            pbar.set_postfix({"Dice": f"{np.mean(dices_rl):.3f}"})
+        pbar.close()
+        elapsed = time.time() - t0
 
         mean_bl = float(np.mean(dices_bl))
         mean_rl = float(np.mean(dices_rl))
         return {
-            "reward":  float(np.mean(rewards)),
-            "dice_bl": mean_bl,
-            "dice_rl": mean_rl,
-            "delta":   mean_rl - mean_bl,
+            "reward":   float(np.mean(rewards)),
+            "dice_bl":  mean_bl,
+            "dice_rl":  mean_rl,
+            "delta":    mean_rl - mean_bl,
+            "time_sec": elapsed,
         }
 
     def train(self, eval_every: int = 20) -> Dict:
@@ -669,8 +738,10 @@ class ROIRefinerTrainer:
             print(f" Validazione su TUTTO il val set ogni {eval_every} iterazioni")
         print(f"{'='*60}")
 
+        self.history.setdefault("iter_time_sec", [])
+
         for ep in range(1, self.episodes + 1):
-            ep_info = self._run_iteration(train=True)
+            ep_info = self._run_iteration(train=True, episode_num=ep)
 
             self._reward_buf.push(ep_info["reward"])
             self._dice_buf.push(ep_info["dice_rl"])
@@ -680,6 +751,7 @@ class ROIRefinerTrainer:
             self.history["dice"].append(ep_info["dice_rl"])
             self.history["dice_smooth"].append(self._dice_buf.mean)
             self.history["epsilon"].append(self.refiner_agent.eps)
+            self.history["iter_time_sec"].append(ep_info["time_sec"])
 
             self.refiner_agent.update_epsilon()
             self.refiner_agent.maybe_sync_target()
@@ -739,6 +811,15 @@ class ROIRefinerTrainer:
                         "n": n_eval,
                     }
                     self.on_eval_callback(ep, eval_stats)
+        else:
+            print(
+                f"Ep {ep:04d}/{self.episodes} | "
+                f"tempo iter={ep_info['time_sec']:.1f}s | "
+                f"R={ep_info['reward']:+.3f} (μ{self._reward_buf.mean:+.3f}) | "
+                f"Dice: BL={ep_info['dice_bl']:.4f} RL={ep_info['dice_rl']:.4f} "
+                f"(μRL={self._dice_buf.mean:.4f} Δ{ep_info['delta']:+.4f}) | "
+                f"ε={self.refiner_agent.eps:.3f}"
+            )
 
         self.refiner_agent.save("final_roi_refiner_agent.pth")
         return self.history

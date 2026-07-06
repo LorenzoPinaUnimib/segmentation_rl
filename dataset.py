@@ -23,7 +23,6 @@ from transforms import (
     normalize_image, get_train_transform, get_val_transform,
     FallbackTransform, HAS_ALBUMENTATIONS,
     robust_intensity_clip, compute_brain_mask, classify_tumor_polarity,
-    white_balance_gray_world, apply_clahe, denoise_light,
 )
 
 try:
@@ -81,23 +80,7 @@ def apply_preprocessing(image_raw: np.ndarray, mask_bin: np.ndarray, cfg: dict) 
     prep = cfg["preprocessing"]
     norm_mode = prep["normalization"]
 
-    # FIX (richiesta esplicita): white-balance + CLAHE (+ denoise opzionale)
-    # PRIMA del clipping/normalizzazione, sui valori "grezzi" come caricati.
-    # Riducono variabilita' che non porta segnale utile (tinte diverse da file
-    # a file, rumore di acquisizione) e aiutano sia l'agente RL che il
-    # regressore supervisionato a "vedere" un'immagine piu' pulita e coerente,
-    # invece di dover imparare anche a ignorare questa variabilita' spuria.
-    image_proc = image_raw
-    if prep.get("white_balance", True):
-        image_proc = white_balance_gray_world(image_proc)
-    if prep.get("clahe", True):
-        clahe_cfg = prep.get("clahe_params", {})
-        image_proc = apply_clahe(image_proc, clip_limit=clahe_cfg.get("clip_limit", 2.0),
-                                  tile_grid_size=clahe_cfg.get("tile_grid_size", (8, 8)))
-    if prep.get("denoise", False):
-        image_proc = denoise_light(image_proc, strength=prep.get("denoise_strength", 5))
-
-    image_for_stats = image_proc.astype(np.float32)
+    image_for_stats = image_raw.astype(np.float32)
     if prep.get("intensity_clip_percentiles"):
         lo, hi = prep["intensity_clip_percentiles"]
         image_for_stats = robust_intensity_clip(image_for_stats, lo, hi)
@@ -109,7 +92,7 @@ def apply_preprocessing(image_raw: np.ndarray, mask_bin: np.ndarray, cfg: dict) 
 
     brain_mask = None
     if prep.get("brain_masking", False):
-        gray_for_mask = image_proc if image_proc.ndim == 2 else image_proc
+        gray_for_mask = image_raw if image_raw.ndim == 2 else image_raw
         brain_mask = compute_brain_mask(gray_for_mask)
 
     return {
@@ -178,6 +161,10 @@ class _BaseTumorDataset(Dataset):
         image = pre["image"]
         brain_mask = pre["brain_mask"]
 
+        # --- AGGIUNGI QUESTE RIGHE QUI SOTTO ---
+        if self.in_channels == 1 and image.shape[0] > 1:
+            image = image[:1, :, :]  # Prendi solo il primo canale in scala di grigi
+        # --------------------------------------
         if image.ndim == 2:
             image = image[..., np.newaxis]
             image = np.repeat(image, 3, axis=-1) if self.use_alb else image
@@ -190,11 +177,13 @@ class _BaseTumorDataset(Dataset):
             image_t = aug["image"].float()
             mask_t = aug["mask"].float()
             brain_mask_t = aug["brain_mask"].float() if self.use_brain_mask else None
+            
         else:
             out = self.transform(image, mask_bin, brain_mask=brain_mask if self.use_brain_mask else None)
             image_t, mask_t = out["image"], out["mask"]
             brain_mask_t = out.get("brain_mask")
 
+            
         if image_t.ndim == 2:
             image_t = image_t.unsqueeze(0)
         if mask_t.ndim == 2:
@@ -395,13 +384,13 @@ def _build_datasets_from_pairs(pairs, inspector, cfg, seed):
     if inspector.coco_mode:
         return (
             COCOAnnotationDataset(train_p, cfg, split="train"),
-            COCOAnnotationDataset(val_p,   cfg, split="val"),
+            COCOAnnotationDataset(val_p,   cfg, split="valid"),
             COCOAnnotationDataset(test_p,  cfg, split="test"),
         )
     else:
         return (
             BrainTumorDataset(train_p, cfg, split="train"),
-            BrainTumorDataset(val_p,   cfg, split="val"),
+            BrainTumorDataset(val_p,   cfg, split="valid"),
             BrainTumorDataset(test_p,  cfg, split="test"),
         )
 

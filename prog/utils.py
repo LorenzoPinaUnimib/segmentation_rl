@@ -6,8 +6,6 @@ Nessuna dipendenza da Gym/SB3 qui: solo numpy/cv2.
 """
 import numpy as np
 
-from config import N_COORD_CHANNELS
-
 
 def linear_schedule(initial_value: float, final_value: float = 0.0):
     """Scheduler compatibile con SB3: riceve progress_remaining (1 -> 0)."""
@@ -16,14 +14,22 @@ def linear_schedule(initial_value: float, final_value: float = 0.0):
     return scheduler
 
 
-def build_coord_planes(cx: float, cy: float, w: float, h: float, W: int, H: int) -> np.ndarray:
-    """4 piani immagine (uint8) che codificano cx, cy, w, h normalizzati in [0,1]."""
+def build_box_vec(cx: float, cy: float, w: float, h: float, W: int, H: int) -> np.ndarray:
+    """Vettore (4,) float32 con cx,cy,w,h normalizzati in [0,1].
+
+    FIX (Dict observation space): sostituisce build_coord_planes. Stessa
+    informazione (posizione/dimensione del box), ma passata come input
+    NUMERICO diretto alla policy tramite la chiave "box_vec" della Dict
+    observation space (vedi environment.py + policy="MultiInputPolicy" in
+    train.py), invece che "spalmata" su 4 piani immagine interi a valore
+    costante. Due vantaggi diretti:
+      - dimezza i canali dell'immagine (8->4: 3 RGB + 1 maschera box) e quindi
+        la RAM del replay buffer di SAC a parita' di buffer_size;
+      - la rete riceve il box come numero esatto invece di doverlo dedurre da
+        un piano spaziale a valore costante -- piu' facile da imparare.
+    """
     norm = np.array([cx / W, cy / H, w / W, h / H], dtype=np.float32)
-    norm = np.clip(norm, 0.0, 1.0)
-    planes = np.zeros((N_COORD_CHANNELS, H, W), dtype=np.uint8)
-    for i, v in enumerate(norm):
-        planes[i, :, :] = np.uint8(v * 255)
-    return planes
+    return np.clip(norm, 0.0, 1.0)
 
 
 def mask_fn(env):
