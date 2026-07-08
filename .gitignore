@@ -8,3 +8,5 @@
 /src
 /rollout_viz
 /prog/ppo_logs
+/checkpoint*
+/progress*

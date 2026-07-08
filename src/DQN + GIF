@@ -20,7 +20,7 @@ class BrainTumorEnv(gymnasium.Env):
 
         # Definizione dell'immagine e del box
         self.observation_space = spaces.Dict({
-            "image": spaces.Box(low=0, high=1, shape=(224, 224, 1), dtype=np.float32),
+            "image": spaces.Box(low=0, high=1, shape=(224, 224, 2), dtype=np.float32),
             "box": spaces.Box(low=0, high=1, shape=(4,), dtype=np.float32)
         })
 
@@ -38,8 +38,8 @@ class BrainTumorEnv(gymnasium.Env):
         # Sceglie un'immagine casuale
         self.current_img_idx = random.randint(0, len(self.images) - 1)
 
-        # Definiamo una box iniziale al centro dell'immagine e di dimensione pari al 100% della stessa
-        box_size = 0.7
+        # Definiamo una box iniziale al centro dell'immagine
+        box_size = 0.5
         start_x = 0.5 - (box_size / 2)
         start_y = 0.5 - (box_size / 2)
         
@@ -52,14 +52,8 @@ class BrainTumorEnv(gymnasium.Env):
         self.prev_dist = None
         self.prev_iou = None
 
-        # Restituisce l'immagine e la box
-        observation = {
-            "image": self.images[self.current_img_idx], 
-            "box": self.agent_box,
-            "idx": self.current_img_idx
-        }
-
-        return observation, {}
+        # Restituisce l'immagine e la box (Modificato: usa _get_obs)
+        return self.get_obs(), {}
 
     def step(self, action):
         # Incrementiamo il numero di passi
@@ -109,15 +103,12 @@ class BrainTumorEnv(gymnasium.Env):
         # Calcolo IoU attuale per info e terminazione
         current_iou = self.calculate_iou(self.agent_box, target)
 
-        # Calcolo la IoU e termino se il valore è sopra a 0.7
+        # Calcolo la IoU e termino se il valore è sopra la soglia
         terminated = False
 
         if current_iou > 0.7:
             terminated = True
-            if current_iou > 0.9:
-                reward += 100
-            else:
-                reward += 50
+            reward += 50
 
         # Controllo se ho raggiunto il massimo numero di passi
         truncated = False
@@ -125,14 +116,32 @@ class BrainTumorEnv(gymnasium.Env):
         if self.step_count >= self.max_steps:
             truncated = True
 
-        # Restituisco l'immagine, la box, la reward totale e le informazioni sulla terminazione
-        observation = {
-            "image": self.images[self.current_img_idx], 
+        # Restituisco l'immagine, la box, la reward totale e le informazioni sulla terminazione (Modificato: usa _get_obs)
+        return self.get_obs(), reward, terminated, truncated, {"iou": current_iou}
+    
+    def get_obs(self):
+        # Recupero l'immagine attuale
+        img = self.images[self.current_img_idx]
+        
+        # Creo una maschera di zeri
+        mask = np.zeros((224, 224), dtype=np.float32)
+        
+        # Calcolo le coordinate in pixel della box agente
+        x, y, w, h = self.agent_box
+        x1, y1 = int(x * 224), int(y * 224)
+        x2, y2 = int((x + w) * 224), int((y + h) * 224)
+        
+        # Riempio di 1 l'area interna alla box
+        mask[max(0, y1):min(224, y2), max(0, x1):min(224, x2)] = 1.0
+        
+        # Unisco l'immagine originale e la maschera in un unico tensore
+        combined_img = np.stack([img, mask], axis=-1)
+        
+        return {
+            "image": combined_img, 
             "box": self.agent_box,
             "idx": self.current_img_idx
         }
-
-        return observation, reward, terminated, truncated, {"iou": current_iou}
 
     def calculate_iou(self, boxA, boxB):
         # Calcolo la Intersection over Union
@@ -152,47 +161,66 @@ class BrainTumorEnv(gymnasium.Env):
         target = self.target_boxes[self.current_img_idx]
         iou = self.calculate_iou(self.agent_box, target)
 
-        # Definisco reward base per questo passo
-        reward = 0.0
+        reward = 0
 
-        # Aumento la reward in base all'avvicinamento dell'agente alla dimensione corretta
+        # Calcolo la reward in base alla variazione dell'IoU
         if self.prev_iou is not None:
-            iou_improvement = iou - self.prev_iou
+            reward = np.sign(iou - self.prev_iou) * 0.05
 
-            if iou_improvement > 0:
-                reward += iou_improvement * 100.0
-            else:
-                reward += iou_improvement * 110.0
+            # iou_improvement = iou - self.prev_iou
+
+            # if iou_improvement > 0:
+            #     reward = iou * 0.3
+
+            # if iou_improvement > 0:
+            #     reward = iou * 0.3
+            # elif iou_improvement < 0:
+            #     reward = -iou * 0.4
         
         # Salvo la IoU attuale
         self.prev_iou = iou
 
-        # Calcolo il centro delle due box
-        center_agent = np.array([self.agent_box[0] + self.agent_box[2]/2, self.agent_box[1] + self.agent_box[3]/2])
-        center_target = np.array([target[0] + target[2]/2, target[1] + target[3]/2])
+        # Definisco reward base per questo passo
+        # reward = 0.0
 
-        # Determino la distanza tra i due centri
-        dist = np.linalg.norm(center_agent - center_target)
+        # # Aumento la reward in base all'avvicinamento dell'agente alla dimensione corretta
+        # if self.prev_iou is not None:
+        #     iou_improvement = iou - self.prev_iou
 
-        # Aumento la reward in base all'avvicinamento delle due box
-        if self.prev_dist is not None:
-            dist_improvement = self.prev_dist - dist
-
-            if (dist_improvement > 0):
-                reward += dist_improvement * 50.0
-            else:
-                reward += dist_improvement * 60.0
+        #     if iou_improvement > 0:
+        #         reward += iou_improvement * 10.0
+        #     else:
+        #         reward += iou_improvement * 11.0
         
-        # Salvo la distanza attuale
-        self.prev_dist = dist
+        # # Salvo la IoU attuale
+        # self.prev_iou = iou
 
-        # Penalizzazione per ogni passo aggiuntivo
-        reward -= 0.02
+        # # Calcolo il centro delle due box
+        # center_agent = np.array([self.agent_box[0] + self.agent_box[2]/2, self.agent_box[1] + self.agent_box[3]/2])
+        # center_target = np.array([target[0] + target[2]/2, target[1] + target[3]/2])
+
+        # # Determino la distanza tra i due centri
+        # dist = np.linalg.norm(center_agent - center_target)
+
+        # # Aumento la reward in base all'avvicinamento delle due box
+        # if self.prev_dist is not None:
+        #     dist_improvement = self.prev_dist - dist
+
+        #     if (dist_improvement > 0):
+        #         reward += dist_improvement * 10.0
+        #     else:
+        #         reward += dist_improvement * 11.0
+        
+        # # Salvo la distanza attuale
+        # self.prev_dist = dist
+
+        # # Penalizzazione per ogni passo aggiuntivo
+        # reward -= 0.02
         
         return reward
 
 def build_dqn_model():
-    img_input = tf.keras.layers.Input(shape=(224, 224, 1), name="image")
+    img_input = tf.keras.layers.Input(shape=(224, 224, 2), name="image")
 
     # Estrazione delle feature dall'immagine
     x = tf.keras.layers.Conv2D(32, 3, activation='relu')(img_input)
@@ -234,7 +262,7 @@ class DQNAgent:
         self.epsilon_min = 0.01
 
         # Diminuzione dopo ogni allenamento (viene moltiplicato ogni volta)
-        self.epsilon_decay = 0.9985
+        self.epsilon_decay = 0.9995
 
         # Crea la rete neurale
         self.model = build_dqn_model()
@@ -267,11 +295,24 @@ class DQNAgent:
         # Estraggo un minibatch
         minibatch = random.sample(self.memory, batch_size)
 
-        # Estrapolo i componenti di un'esperienza
-        states_img = np.array([all_images[m[0]] for m in minibatch], dtype=np.float32)
+        # Funzione interna per generare la maschera e unirla all'immagine
+        def create_combined_input(idx, box):
+            img = all_images[idx]
+            mask = np.zeros((224, 224), dtype=np.float32)
+            x, y, w, h = box
+            x1, y1 = int(x * 224), int(y * 224)
+            x2, y2 = int((x + w) * 224), int((y + h) * 224)
+            mask[max(0, y1):min(224, y2), max(0, x1):min(224, x2)] = 1.0
+            return np.stack([img, mask], axis=-1)
+
+        # Estrapolo i componenti e genero gli input a 2 canali
+        states_img = np.array([create_combined_input(m[0], m[1]) for m in minibatch], dtype=np.float32)
         states_box = np.array([m[1] for m in minibatch], dtype=np.float32)
-        next_states_img = np.array([all_images[m[4]] for m in minibatch], dtype=np.float32)
+        
+        next_states_img = np.array([create_combined_input(m[4], m[5]) for m in minibatch], dtype=np.float32)
         next_states_box = np.array([m[5] for m in minibatch], dtype=np.float32)
+        
+        # ... (continuazione del metodo replay)
         rewards = np.array([m[3] for m in minibatch], dtype=np.float32)
         actions = np.array([m[2] for m in minibatch])
         dones = np.array([m[6] for m in minibatch])
@@ -297,6 +338,37 @@ class DQNAgent:
         # Diminuisco la epsilon
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
+
+    def save(self, folder="checkpoint", episode=0, rewards_history=[], ious_history=[]):
+        # Crea la cartella se non esiste
+        if not os.path.exists(folder):
+            os.makedirs(folder)
+        
+        # Salvo i pesi del modello e del target model
+        self.model.save_weights(os.path.join(folder, "model.weights.h5"))
+        self.target_model.save_weights(os.path.join(folder, "target.weights.h5"))
+        
+        # Salvo l'epsilon, i reward e IoU per riprendere l'esplorazione dallo stesso punto
+        with open(os.path.join(folder, "agent_params.json"), "w") as f:
+            json.dump({
+                "episode" : episode,
+                "epsilon": self.epsilon,
+                "rewards_history": rewards_history,
+                "ious_history": ious_history
+            }, f)
+
+    def load(self, folder="checkpoint"):
+        # Verifico se i file esistono prima di caricare
+        if os.path.exists(os.path.join(folder, "model.weights.h5")):
+            self.model.load_weights(os.path.join(folder, "model.weights.h5"))
+            self.target_model.load_weights(os.path.join(folder, "target.weights.h5"))
+            
+            with open(os.path.join(folder, "agent_params.json"), "r") as f:
+                params = json.load(f)
+                self.epsilon = params.get("epsilon", self.epsilon)
+                return True, params.get("episode", 0), params.get("rewards_history", []), params.get("ious_history", [])
+            
+        return False, 0, [], []
 
 def load_coco_dataset(folder_path):
     # Carico il file delle annotazioni
@@ -360,7 +432,10 @@ def visualize_progress_gif(env, agent, episode):
     
     for i in range(num_samples):
         # Scelgo un'immagine casuale
-        idx = random.randint(0, len(env.images) - 1)
+        if (i <= 5):
+            idx = i * 10
+        else:
+            idx = random.randint(0, len(env.images) - 1)
         
         # Imposto l'immagine nell'ambiente
         state, _ = env.reset()
@@ -394,7 +469,7 @@ def visualize_progress_gif(env, agent, episode):
         # Simulo l'agente
         for step in range(200):
             action = agent.act(state, training=False)
-            next_state, _, terminated, truncated, _ = env.step(action)
+            next_state, reward, terminated, truncated, _ = env.step(action)
             state = next_state
             
             # Genero il frame
@@ -405,7 +480,7 @@ def visualize_progress_gif(env, agent, episode):
             rect_agent.set_width(current_box[2]*224)
             rect_agent.set_height(current_box[3]*224)
 
-            ax.set_title(f"Ep {episode} - Img {i+1} - Step {step}")
+            ax.set_title(f"Ep {episode} - Img {i+1} - Step {step} - Reward: {reward:.2f}")
             
             fig.canvas.draw()
             image = np.asarray(fig.canvas.buffer_rgba()).copy()
@@ -433,23 +508,32 @@ def __main__():
     env_test = BrainTumorEnv(test_images, test_boxes)
     agent = DQNAgent(action_size=8)
 
-    # Definizione variabili di addestramento
-    episodes = 4000
-    batch_size = 64
-
     # Array per tracciare variazioni
     rewards_history = []
     ious_history = []
 
+    # Controllo la presenza di checkpoint
+    start_episode = 0
+    loaded, start_episode, rewards_history, ious_history = agent.load("checkpoint")
+
+    if loaded:
+        print("Modello caricato correttamente dal checkpoint. Riprendo l'addestramento...")
+    else:
+        print("Nessun checkpoint trovato. Inizio addestramento da zero.")
+
+    # Definizione variabili di addestramento
+    episodes = 4000
+    batch_size = 64
+
     # Ciclo di addestramento
-    for e in range(episodes):
+    for e in range(start_episode, episodes):
         # Resetto l'ambiente e le variabili
         state, _ = env_train.reset() 
         total_reward = 0
         episode_ious = []
         
         # Singolo ciclo di addestramento
-        for _ in range(env_train.max_steps):
+        for step in range(env_train.max_steps):
             # Determino la prossima azione e la eseguo
             action = agent.act(state)
             next_state, reward, terminated, truncated, info = env_train.step(action)
@@ -467,6 +551,10 @@ def __main__():
             state = next_state
             total_reward += reward
 
+            if step % (env_train.max_steps // 5) == 0:
+                # Aggiorno la rete neurale
+                agent.replay(batch_size, train_images)
+
             if done:
                 break
         
@@ -475,9 +563,6 @@ def __main__():
         rewards_history.append(total_reward)
         ious_history.append(final_iou)
         
-        # Aggiorno la rete neurale
-        agent.replay(batch_size, train_images)
-        
         # Stampo dei dati di verifica ogni 20 episodi
         if (e + 1) % 20 == 0:
             agent.update_target_model()
@@ -485,6 +570,11 @@ def __main__():
             avg_iou = np.mean(ious_history[-20:])
             print(f"Episodio: {e+1}/{episodes}, Reward: {total_reward:.2f}, Media 20 ep: {avg_reward:.2f}, IoU Media 20 ep: {avg_iou:.4f}, Epsilon: {agent.epsilon:.2f}")
         
+        # Salvo ogni 100 episodi per riprendere successivamente
+        if (e + 1) % 100 == 0:
+            agent.save("checkpoint", e + 1, rewards_history, ious_history)
+            print(f"Checkpoint salvato all'episodio {e+1}")
+
         # Eseguo un agente e stampo tutte le mosse nell'immagine per verificare il livello di apprendimento
         if (e + 1) % 200 == 0:
             visualize_progress_gif(env_train, agent, e + 1)
@@ -539,4 +629,5 @@ def __main__():
     plt.savefig("reward.png")
     plt.show()
 
-__main__()
+if __name__ == "__main__":
+    __main__()
