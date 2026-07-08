@@ -31,14 +31,31 @@ from collections import deque
 from config import (
     N_ACTIONS, ALPHA, REWARD_POSITIVE, REWARD_NEGATIVE, 
     TRIGGER_REWARD, TAU_IOU, HISTORY_LENGTH, CONTEXT_PIXELS, WARP_SIZE,
-    MAX_STEPS_PER_EPISODE
+    MAX_STEPS_PER_EPISODE, GIOU_SHAPING_SCALE, STEP_PENALTY
 )
-from utils import compute_iou, extract_warped_region
+from utils import compute_iou, compute_giou, extract_warped_region
 
 class ActiveLocalizationEnv(gym.Env):
-    def __init__(self, pytorch_dataset):
+    def __init__(self, pytorch_dataset, reward_mode="paper"):
         super().__init__()
         self.dataset = pytorch_dataset
+        # NUOVO (diagnosi dataset vs architettura): due modalita' di reward,
+        # selezionabili per isolare l'effetto della reward function dal
+        # resto -- vedi train.py --reward-mode.
+        #   'paper' (default): binario puro, sign(delta-IoU) in {-1,+1} per i
+        #      movimenti, trigger +-eta FISSO (Eq. 2/3 esatte del paper,
+        #      Caicedo & Lazebnik). E' la reward con cui il paper riporta i
+        #      suoi risultati; gli autori la preferiscono esplicitamente a
+        #      una versione continua ("the difference in IoU is small enough
+        #      to confuse the agent... binary rewards communicate more
+        #      clearly").
+        #   'shaped': reward continua basata su delta-GIoU + step-penalty +
+        #      trigger penalty graduata (introdotta in questa chat per dare
+        #      un segnale piu' ricco, specie su box disgiunti). Deviazione
+        #      deliberata dal paper.
+        if reward_mode not in ("paper", "shaped"):
+            raise ValueError(f"reward_mode sconosciuto: {reward_mode!r} (valori validi: 'paper', 'shaped')")
+        self.reward_mode = reward_mode
         sample = self.dataset[0]
         self.C, self.H, self.W = sample["image"].shape
         
@@ -85,6 +102,10 @@ class ActiveLocalizationEnv(gym.Env):
         
         self.current_step = 0
         self.previous_iou = compute_iou(self.box, self.gt_box)
+        # FIX (reward shaping): teniamo traccia anche del GIoU dello stato
+        # iniziale, usato sia dal reward continuo in step() sia dalla guida
+        # (get_positive_actions) al posto del solo IoU piano.
+        self.previous_giou = compute_giou(self.box, self.gt_box)
         
         return self._get_obs(), {}
 
@@ -116,14 +137,31 @@ class ActiveLocalizationEnv(gym.Env):
         return np.array([x, y, w, h], dtype=np.float32)
 
     def get_positive_actions(self):
-        """Apprenticeship Learning: restituisce le azioni che aumentano l'IoU."""
+        """Apprenticeship Learning: restituisce le azioni che migliorano lo stato.
+
+        In modalita' 'paper' il criterio e' l'aumento dell'IoU piano (esattamente
+        come nel paper: la guida usa lo stesso segnale della reward, sign(delta-IoU)).
+        In modalita' 'shaped' il criterio e' l'aumento del GIoU (vedi FIX storico
+        sotto): con l'IoU piano, quando il box e' ancora completamente disgiunto
+        dal target (IoU=0, tipico nei primi step di ogni episodio) NESSUNA azione
+        fa aumentare l'IoU -- restano tutte a 0 -- quindi la lista tornava quasi
+        sempre vuota proprio nella fase in cui la guida servirebbe di piu'. Il
+        paper accetta questo limite (e infatti prevede il fallback a un'azione
+        totalmente casuale quando il set e' vuoto, vedi train.py); la modalita'
+        'shaped' lo evita usando il GIoU, informativo anche su box disgiunti.
+        """
         positive = []
         for a in range(N_ACTIONS - 1): # Escludi il trigger
             new_box = self._apply_action(self.box, a)
-            if compute_iou(new_box, self.gt_box) > self.previous_iou:
+            if self.reward_mode == "paper":
+                improves = compute_iou(new_box, self.gt_box) > self.previous_iou
+            else:
+                improves = compute_giou(new_box, self.gt_box) > self.previous_giou
+            if improves:
                 positive.append(a)
         
-        # Verifica se il trigger è un'azione positiva (IoU >= tau)
+        # Verifica se il trigger è un'azione positiva (IoU >= tau, criterio
+        # di successo del dominio in ENTRAMBE le modalita': resta l'IoU piano)
         if self.previous_iou >= TAU_IOU:
             positive.append(8)
             
@@ -140,21 +178,47 @@ class ActiveLocalizationEnv(gym.Env):
         terminated = False
         truncated = self.current_step >= MAX_STEPS_PER_EPISODE
 
+        new_giou = compute_giou(self.box, self.gt_box)
         if action == 8: # TRIGGER
             iou = compute_iou(self.box, self.gt_box)
-            reward = TRIGGER_REWARD if iou >= TAU_IOU else -TRIGGER_REWARD
+            if self.reward_mode == "paper":
+                # Eq. 3 esatta: binario fisso, nessuna gradazione.
+                reward = TRIGGER_REWARD if iou >= TAU_IOU else -TRIGGER_REWARD
+            elif iou >= TAU_IOU:
+                reward = TRIGGER_REWARD
+            else:
+                # FIX (modalita' 'shaped'): penalita' del trigger fallito
+                # scalata in base a quanto si e' lontani da TAU_IOU, invece
+                # di un valore fisso uguale sia per un trigger "quasi giusto"
+                # (iou=0.55) sia per uno completamente sbagliato (iou=0.05).
+                miss_ratio = max(0.0, (TAU_IOU - iou) / TAU_IOU)
+                reward = -TRIGGER_REWARD * (0.3 + 0.7 * miss_ratio)
             terminated = True
         else:
             self.box = self._apply_action(self.box, action)
-            new_iou = compute_iou(self.box, self.gt_box)
-            
-            # Eq 2: Reward binario basato sul segno del delta IoU
-            if new_iou > self.previous_iou:
-                reward = REWARD_POSITIVE
+
+            if self.reward_mode == "paper":
+                # Eq. 2 esatta: SOLO il segno del delta IoU, +-1, nessuna
+                # magnitudo, nessuno step-penalty (il costo del tempo e'
+                # implicito nello sconto gamma del Q-learning, non un
+                # termine additivo nel reward -- il paper lo sceglie
+                # deliberatamente al posto del continuo, vedi docstring
+                # del costruttore).
+                new_iou = compute_iou(self.box, self.gt_box)
+                reward = (REWARD_POSITIVE if new_iou > self.previous_iou else REWARD_NEGATIVE) - STEP_PENALTY
+                self.previous_iou = new_iou
+                self.previous_giou = compute_giou(self.box, self.gt_box)  # tenuto aggiornato per coerenza interna
             else:
-                reward = REWARD_NEGATIVE
+                # FIX (modalita' 'shaped', vedi config.py per la motivazione
+                # estesa): reward continuo proporzionale al delta di GIoU
+                # invece del segno del delta IoU piano.
+                delta_giou = new_giou - self.previous_giou
+                reward = float(np.clip(GIOU_SHAPING_SCALE * delta_giou, -1.0, 1.0)) - STEP_PENALTY
+                self.previous_giou = new_giou
+                self.previous_iou = compute_iou(self.box, self.gt_box)
                 
-            self.previous_iou = new_iou
+            #if self.current_step >= MAX_STEPS_PER_EPISODE:
+            #    reward -= 3.0* (1-new_giou)
 
         return self._get_obs(), reward, terminated, truncated, {}
     
