@@ -5,6 +5,7 @@
 # DA AGGIUNGERE spiegazione modello e reward, grafici andamento reward, spiegazione apprendimento agente RL, tipologie di modifiche che abbiamo provato e bibliografia
 
 Abbiamo modificato più volte modello, reward, decadimento di epsilon, dimensione box iniziale del modello, spazio delle azioni (con o senza terminazione), modalità di acquisizione feature dall'immagine, tentato curriculum learning.
+Aggiungere parte su descrizione dataset.
 
 ## Indice
 
@@ -33,15 +34,30 @@ Abbiamo modificato più volte modello, reward, decadimento di epsilon, dimension
 
 ## 1. Introduzione e motivazione del problema
 
-Il progetto affronta il compito di localizzare un tumore cerebrale all'interno di un'immagine di risonanza magnetica (MRI) per mezzo di Reinforcement Learning: un agente osserva l'immagine e la posizione corrente di un riquadro (bounding box), e ad ogni passo temporale decide come modificarlo (spostandolo, ridimensionandolo o fermandosi) fino a farlo coincidere il più possibile con l'area occupata dal tumore.
+Il progetto affronta il compito di localizzare un tumore cerebrale all'interno di un'immagine di risonanza magnetica (MRI) per mezzo di Reinforcement Learning: un agente osserva l'immagine e la posizione corrente di un riquadro (bounding box) e, ad ogni passo temporale, decide come modificarlo (spostandolo, ridimensionandolo o fermandosi) fino a farlo coincidere il più possibile con l'area occupata dal tumore.
 
 Questa impostazione possiede alcune proprietà interessanti rispetto alla segmentazione diretta:
 
-- **Interpretabilità del processo**: ogni traiettoria dell'agente è una sequenza di decisioni ispezionabili (quali azioni, in che ordine, con quale guadagno di IoU).
+- Interpretabilità: ogni traiettoria dell'agente è una sequenza di decisioni ispezionabili (quali azioni, in che ordine, con quale guadagno di IoU).
 - **Segnale di supervisione debole**: il segnale di reward deriva dalla maschera di verità (ground truth) solo indirettamente, tramite la metrica di Intersection-over-Union (IoU) tra il box corrente e il box che racchiude la maschera.
-- **Naturale predisposizione al curriculum learning**: la difficoltà del compito (distanza iniziale del box dal target) è un parametro continuo e facilmente controllabile, aprendo la porta a strategie di apprendimento progressivo.
+- Naturale predisposizione al curriculum learning: la difficoltà del compito (distanza iniziale del box dal target) è un parametro facilmente controllabile, aprendo la porta a strategie di apprendimento progressivo.
 
 ---
+
+## 1.1. Reinforcement Learning
+
+Il Reinforcement Learning (RL o apprendimento per rinforzo) è un metodo di Machine Learning in cui un agente impara a prendere decisioni interagendo con un ambiente.
+Ad ogni passo temporale l’agente osserva lo stato dell’ambiente, sceglie un’azione e riceve in risposta una ricompensa (reward) e un nuovo stato. L’obiettivo dell’agente è massimizzare nel tempo la somma delle ricompense, trovando così una politica di comportamento ottimale.
+
+L’interazione può essere modellata come un processo di decisione markoviano (MDP), caratterizzato da uno spazio degli stati, uno spazio delle azioni, una dinamica di transizione, una funzione di ricompensa e un fattore di sconto.
+
+## 1.2 Curriculum Learning
+
+Il Curriculum Learning è un approccio di addestramento nel quale la rete viene inizialmente addestrada con degli esempi semplici e man mano che l'addestramento procede si aumenta la difficoltà degli esempi. L'obiettivo è quello di migliorare la velocità di training.
+
+## 2. Dataset
+
+Abbiamo scelto il dataset [Brain Tumor Image DataSet: Semantic Segmentation](https://www.kaggle.com/datasets/pkdarabi/brain-tumor-image-dataset-semantic-segmentation) che contiene 2146 immagini ottenute tramite scansioni MRI di cervelli che presentavano tumori celebrali. Le immagini sono già divise in train, test e valid (rispettivamente 1502, 215 e 429) e contengono le informazioni relative alla box in cui è presente il tumore stesso.
 
 ## 2. Panoramica architetturale del sistema (da revisionare)
 
