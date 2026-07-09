@@ -1,12 +1,10 @@
-# Localizzazione di Tumori Cerebrali via Reinforcement Learning
-## Un agente che impara a muovere un bounding box: architettura, teoria e ingegneria di un sistema MaskablePPO / SAC per la segmentazione debole di immagini MRI
+# Localizzazione di Tumori Cerebrali tramite Reinforcement Learning
 
----
+# Relazione di Progetto di Sistemi Complessi: Modelli e Simulazione di Pina Lorenzo 894396 e Rancati Simone 900052
 
-**Relazione tecnica del progetto `segmentation_rl`**
-Modulo analizzato: `prog/train.py` e l'intero pacchetto di dipendenze (`config.py`, `environment.py`, `callbacks.py`, `dataset.py`, `dataset_inspector.py`, `transforms.py`, `localizer.py`, `utils.py`, `visual_evaluator.py`).
+# DA AGGIUNGERE spiegazione modello e reward, grafici andamento reward, spiegazione apprendimento agente RL, tipologie di modifiche che abbiamo provato e bibliografia
 
----
+Abbiamo modificato più volte modello, reward, decadimento di epsilon, dimensione box iniziale del modello, spazio delle azioni (con o senza terminazione), modalità di acquisizione feature dall'immagine, tentato curriculum learning.
 
 ## Indice
 
@@ -35,19 +33,17 @@ Modulo analizzato: `prog/train.py` e l'intero pacchetto di dipendenze (`config.p
 
 ## 1. Introduzione e motivazione del problema
 
-Il progetto affronta il compito di **localizzare un tumore cerebrale all'interno di un'immagine di risonanza magnetica (MRI)** rappresentandolo non come un problema di segmentazione semantica pixel-per-pixel (come farebbe una U-Net) né come detection one-shot (come farebbe un modello YOLO/Faster R-CNN), bensì come un **problema di controllo sequenziale**: un agente osserva l'immagine e la posizione corrente di un riquadro (bounding box), e ad ogni passo temporale decide come modificarlo — spostandolo, ridimensionandolo o, nella variante discreta, fermandosi — fino a farlo coincidere il più possibile con l'area occupata dal tumore.
+Il progetto affronta il compito di localizzare un tumore cerebrale all'interno di un'immagine di risonanza magnetica (MRI) per mezzo di Reinforcement Learning: un agente osserva l'immagine e la posizione corrente di un riquadro (bounding box), e ad ogni passo temporale decide come modificarlo (spostandolo, ridimensionandolo o fermandosi) fino a farlo coincidere il più possibile con l'area occupata dal tumore.
 
-Questa impostazione, nota in letteratura come *active/sequential object localization* (Caicedo & Lazebnik, 2015; Bueno et al., 2016), possiede alcune proprietà interessanti rispetto alla segmentazione diretta:
+Questa impostazione possiede alcune proprietà interessanti rispetto alla segmentazione diretta:
 
-- **Interpretabilità del processo**: ogni traiettoria dell'agente è una sequenza di decisioni ispezionabili (quali azioni, in che ordine, con quale guadagno di IoU), non un'unica mappa di attivazione opaca.
-- **Segnale di supervisione debole**: il segnale di reward deriva dalla maschera di verità (ground truth) solo indirettamente, tramite la metrica di Intersection-over-Union (IoU) tra il box corrente e il box che racchiude la maschera — non è necessario un decoder pixel-wise.
-- **Naturale predisposizione al curriculum learning**: la difficoltà del compito (distanza iniziale del box dal target) è un parametro continuo e facilmente controllabile, aprendo la porta a strategie di apprendimento progressivo (Bengio et al., 2009; Narvekar et al., 2020).
-
-Il progetto è interessante anche dal punto di vista ingegneristico perché **implementa in parallelo due formulazioni alternative dello stesso problema**: una variante ad azioni discrete allenata con un algoritmo *on-policy* con mascheramento delle azioni (**MaskablePPO**, da `sb3-contrib`), e una variante recente (etichettata nel codice come "FIX v7") ad azioni continue allenata con un algoritmo *off-policy* **Soft Actor-Critic (SAC)**. La coesistenza di questi due rami, ricostruibile dai numerosi commenti storici lasciati nel codice, costituisce di fatto un caso di studio end-to-end sul processo di iterazione e debug di un sistema di RL applicato a un dominio reale, comprese le patologie tipiche (collasso della policy su un'unica azione, instabilità del curriculum, memory blow-up dei replay buffer con osservazioni ad immagine) e le rispettive soluzioni.
+- **Interpretabilità del processo**: ogni traiettoria dell'agente è una sequenza di decisioni ispezionabili (quali azioni, in che ordine, con quale guadagno di IoU).
+- **Segnale di supervisione debole**: il segnale di reward deriva dalla maschera di verità (ground truth) solo indirettamente, tramite la metrica di Intersection-over-Union (IoU) tra il box corrente e il box che racchiude la maschera.
+- **Naturale predisposizione al curriculum learning**: la difficoltà del compito (distanza iniziale del box dal target) è un parametro continuo e facilmente controllabile, aprendo la porta a strategie di apprendimento progressivo.
 
 ---
 
-## 2. Panoramica architetturale del sistema
+## 2. Panoramica architetturale del sistema (da revisionare)
 
 Il pacchetto è organizzato in moduli con responsabilità nettamente separate, un buon esempio di *separation of concerns* applicato a un progetto di ricerca:
 
@@ -96,16 +92,16 @@ dataset_inspector.py ──► dataset.py ──► get_datasets(cfg)
 
 ## 3. Formalizzazione come processo decisionale di Markov
 
-Per inquadrare rigorosamente il problema come RL, lo si definisce come un **Processo Decisionale di Markov (MDP)** parzialmente osservabile tramite immagine, nella forma a 5-tupla $(\mathcal{S}, \mathcal{A}, P, R, \gamma)$:
+Per inquadrare rigorosamente il problema come RL, lo si definisce come un Processo Decisionale di Markov (MDP) parzialmente osservabile tramite immagine, nella forma a 5-tupla $(\mathcal{S}, \mathcal{A}, P, R, \gamma)$:
 
 ### 3.1 Stato e osservazione
 
-Lo **stato latente** ad ogni istante $t$ è composto da:
+Lo stato ad ogni istante $t$ è composto da:
 - l'immagine corrente $I \in \mathbb{R}^{C \times H \times W}$ (fissa per l'intero episodio, $C=3$, $H=W=224$);
 - i parametri geometrici del box predetto $(c_x, c_y, w, h)$ (centro e dimensioni, in pixel);
-- il box di verità $(gt_x, gt_y, gt_w, gt_h)$, derivato dal bounding box che racchiude la maschera binaria (mai osservato direttamente dall'agente, usato solo per calcolare il reward).
+- il box di verità $(gt_x, gt_y, gt_w, gt_h)$, derivato dal bounding box che racchiude la maschera binaria (usato solo per calcolare il reward).
 
-L'**osservazione** fornita alla policy è uno spazio `gymnasium.spaces.Dict` con due chiavi (si veda `environment.py`, `_get_obs`):
+L'osservazione fornita alla policy è uno spazio `gymnasium.spaces.Dict` con due chiavi (si veda `environment.py`, `_get_obs`):
 
 ```python
 observation_space = spaces.Dict({
@@ -114,39 +110,36 @@ observation_space = spaces.Dict({
 })
 ```
 
-- **`image`**: l'immagine RGB (3 canali) concatenata con una maschera binaria rasterizzata del box corrente (1 canale aggiuntivo, disegnata con `cv2.rectangle(..., thickness=-1)`), per un totale di 4 canali.
-- **`box_vec`**: il vettore $(c_x/W,\; c_y/H,\; w/W,\; h/H)$ normalizzato in $[0,1]$ (funzione `build_box_vec` in `utils.py`).
+- `image`: l'immagine RGB (3 canali) concatenata con una maschera binaria rasterizzata del box corrente (1 canale aggiuntivo, disegnata con `cv2.rectangle(..., thickness=-1)`), per un totale di 4 canali.
+- `box_vec`: il vettore $(c_x/W,\; c_y/H,\; w/W,\; h/H)$ normalizzato in $[0,1]$ (funzione `build_box_vec` in `utils.py`).
 
-Questa è una scelta progettuale esplicitamente motivata nel codice (commento "FIX (Dict observation space)"): in una versione precedente le coordinate del box venivano "spalmate" su 4 piani immagine interi a valore costante (8 canali totali), un formato che (a) raddoppiava il numero di canali dell'immagine — e quindi la RAM del replay buffer SAC, poiché `DictReplayBuffer` non supporta `optimize_memory_usage` — e (b) costringeva la rete a *dedurre* il valore numerico del box da un piano spaziale costante invece di riceverlo come input diretto. Passare a un vettore numerico esplicito dimezza i canali immagine (da 8 a 4) e fornisce l'informazione geometrica in una forma più facile da apprendere.
+Questa è una scelta progettuale esplicitamente motivata nel codice (commento "FIX (Dict observation space)"): in una versione precedente le coordinate del box venivano "spalmate" su 4 piani immagine interi a valore costante (8 canali totali), un formato che (a) raddoppiava il numero di canali dell'immagine — e quindi la RAM del replay buffer SAC, poiché `DictReplayBuffer` non supporta `optimize_memory_usage` — e (b) costringeva la rete a dedurre il valore numerico del box da un piano spaziale costante invece di riceverlo come input diretto. Passare a un vettore numerico esplicito dimezza i canali immagine (da 8 a 4) e fornisce l'informazione geometrica in una forma più facile da apprendere.
 
 Su questo tipo di osservazione la rete usata da Stable-Baselines3/`sb3-contrib` è un `CombinedExtractor` (attivato passando `policy="MultiInputPolicy"`), che instrada automaticamente ogni chiave verso il sotto-estrattore appropriato — una CNN (`NatureCNN`, Mnih et al., 2015) per `"image"` e un semplice flatten per `"box_vec"` — per poi concatenare le feature risultanti prima delle teste policy/valore.
 
 ### 3.2 Spazio delle azioni
 
-Duplice, a seconda della modalità di training (si veda §8 e §9):
-
-- **Discreto** (`spaces.Discrete(9)`): 4 direzioni di traslazione, 4 direzioni di resize, 1 azione STOP.
-- **Continuo** (`spaces.Box(shape=(4,), low=-1, high=1)`): un vettore $[\Delta c_x, \Delta c_y, \Delta w, \Delta h]$ normalizzato, senza azione STOP — l'episodio dura sempre `max_steps`.
+Lo spaziod delle azioni è discreto (`spaces.Discrete(9)`): 4 direzioni di traslazione, 4 direzioni di ridimensionamento e 1 azione di stop.
 
 ### 3.3 Dinamica di transizione
 
-Deterministica data l'azione: la geometria del box viene aggiornata (traslazione/resize) e poi vincolata (`clip`) affinché resti dentro l'immagine e con dimensioni minime di 12 pixel. L'unica fonte di stocasticità è nel `reset()`, che determina l'immagine campionata dal dataset e la posizione/dimensione iniziale del box (si veda §6.2).
+La geometria del box viene aggiornata e poi vincolata (`clip`) affinché resti dentro l'immagine e con dimensioni minime di 12 pixel. L'unica fonte di stocasticità è nel `reset()`, che determina l'immagine campionata dal dataset e la posizione e dimensione iniziale del box.
 
-### 3.4 Funzione di reward
+### 3.4 Funzione di reward (da aggiornare una volta scelto cosa mettere)
 
 Combinazione lineare pesata di più segnali (dettagliata in §7): guadagno di IoU, avvicinamento del centro, penalità di tempo, penalità di sovradimensionamento, penalità di oscillazione/jerk, e un bonus terminale calcolato alla fine dell'episodio.
 
 ### 3.5 Orizzonte ed episodio
 
-`max_steps = MAX_STEPS_PER_EPISODE = 200` (da `config.py`). Nel ramo discreto l'episodio può terminare anticipatamente (`terminated=True`) se l'agente sceglie l'azione STOP, altrimenti viene troncato (`truncated=True`) al raggiungimento di `max_steps`. Nel ramo continuo non esiste terminazione anticipata: l'episodio dura sempre `max_steps` e viene sempre troncato.
+L'episodio può terminare anticipatamente (`terminated=True`) se l'agente sceglie l'azione stop, altrimenti viene troncato (`truncated=True`) al raggiungimento di `max_steps`.
 
 ### 3.6 Fattore di sconto
 
-$\gamma = 0.99$ per entrambi gli algoritmi, un valore standard che bilancia l'orizzonte di pianificazione (200 step) con la stabilità delle stime di valore.
+$\gamma = 0.99$ bilancia l'orizzonte di pianificazione con la stabilità delle stime di valore.
 
 ---
 
-## 4. Pipeline dei dati: acquisizione, ispezione, dataset
+## 4. Pipeline dei dati: acquisizione, ispezione, dataset (da rivedere)
 
 ### 4.1 `dataset_inspector.py`: scoperta automatica delle coppie immagine/maschera
 
@@ -720,7 +713,15 @@ Il progetto `segmentation_rl` costituisce un'implementazione matura e ben strume
 
 ## 20. Bibliografia
 
-1. Schulman, J., Wolski, F., Dhariwal, P., Radford, A., & Klimov, O. (2017). *Proximal Policy Optimization Algorithms*. arXiv:1707.06347.
+1. Stember, J.N., Shalu, H.. Reinforcement learning using Deep networks and learning accurately localizes brain tumors on MRI with very small training sets (2022). DOI 10.1186/s12880-022-00919-x, https://doi.org/10.1186/s12880-022-00919-x
+2. Ding, Yi and Qin, Xue and Zhang, Mingfeng and Geng, Ji and Chen, Dajiang and Deng, Fuhu and Song, Chunhe. RLSegNet: An Medical Image Segmentation Network Based on Reinforcement Learning (2023). DOI 10.1109/TCBB.2022.3195705, https://ieeexplore-ieee-org.unimib.idm.oclc.org/abstract/document/9847069
+3. Joseph Stember, Hrithwik Shalu. Deep reinforcement learning to detect brain lesions on MRI: a proof-of-concept application of reinforcement learning to medical images (2008). DOI 10.48550/arXiv.2008.02708, https://doi.org/10.48550/arXiv.2008.02708
+4. Juan C. Caicedo, Svetlana Lazebnik. Active Object Localization with Deep Reinforcement Learning (2015). DOI 10.48550/arXiv.1511.06015, https://doi.org/10.48550/arXiv.1511.06015
+
+Da togliere se non necessari:
+
+5. Zequn Jie, Xiaodan Liang, Jiashi Feng, Xiaojie Jin, Wen Feng Lu, Shuicheng Yan. Tree-Structured Reinforcement Learning for Sequential Object Localization (2017). DOI 10.48550/arXiv.1703.02710, https://doi.org/10.48550/arXiv.1703.02710
+
 2. Schulman, J., Moritz, P., Levine, S., Jordan, M., & Abbeel, P. (2016). *High-Dimensional Continuous Control Using Generalized Advantage Estimation*. ICLR.
 3. Haarnoja, T., Zhou, A., Abbeel, P., & Levine, S. (2018). *Soft Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning with a Stochastic Actor*. ICML.
 4. Haarnoja, T., Zhou, A., Hartikainen, K., et al. (2018). *Soft Actor-Critic Algorithms and Applications*. arXiv:1812.05905 (versione con temperatura auto-regolata).
@@ -735,12 +736,7 @@ Il progetto `segmentation_rl` costituisce un'implementazione matura e ben strume
 13. Zuiderveld, K. (1994). *Contrast Limited Adaptive Histogram Equalization*. Graphics Gems IV, Academic Press.
 14. Tomasi, C., & Manduchi, R. (1998). *Bilateral Filtering for Gray and Color Images*. ICCV.
 15. Buslaev, A., Iglovikov, V. I., Khvedchenya, E., Parinov, A., Druzhinin, M., & Kalinin, A. A. (2020). *Albumentations: Fast and Flexible Image Augmentations*. Information, 11(2), 125.
-16. Lin, T.-Y., Maire, M., Belongie, S., et al. (2014). *Microsoft COCO: Common Objects in Context*. ECCV. (formato di annotazione poligonale usato da `COCOAnnotationDataset`)
 17. Ronneberger, O., Fischer, P., & Brox, T. (2015). *U-Net: Convolutional Networks for Biomedical Image Segmentation*. MICCAI. (riferimento concettuale per il confronto con la segmentazione diretta discusso in §1)
 18. Kingma, D. P., & Ba, J. (2015). *Adam: A Method for Stochastic Optimization*. ICLR. (ottimizzatore usato in `localizer.py`)
 19. Raffin, A., Hill, A., Gleave, A., Kanervisto, A., Ernestus, M., & Dormann, N. (2021). *Stable-Baselines3: Reliable Reinforcement Learning Implementations*. JMLR, 22(268), 1–8.
 20. Towers, M., Terry, J. K., Kwiatkowski, A., et al. (2023). *Gymnasium* (successore manutenuto di OpenAI Gym), Farama Foundation.
-
----
-
-*Relazione redatta tramite analisi diretta del codice sorgente del progetto (`train.py` e moduli dipendenti: `config.py`, `environment.py`, `callbacks.py`, `dataset.py`, `dataset_inspector.py`, `transforms.py`, `localizer.py`, `utils.py`, `visual_evaluator.py`), incluse le note storiche di sviluppo (commenti "FIX v2"–"FIX v7") lasciate nel codice stesso, usate come fonte primaria per ricostruire la cronologia evolutiva del progetto.*
