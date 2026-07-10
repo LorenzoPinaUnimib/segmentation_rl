@@ -564,7 +564,7 @@ class QNetwork(nn.Module):
         return q
 
 class PolicyNetwork(nn.Module):
-    def __init__(self, history_dim, n_actions, pretrained_backbone=None):
+    def __init__(self, history_dim, n_actions, pretrained_backbone=None, use_spatial_attention=None):
         super().__init__()
         from torchvision.models import resnet18, ResNet18_Weights
 
@@ -580,40 +580,48 @@ class PolicyNetwork(nn.Module):
         self._backbone_channels = 512
         self._backbone_spatial = WARP_SIZE[0] // 32
 
-        # Caricamento pesi custom se forniti
-        if pretrained_backbone is not None:
-            checkpoint = torch.load(pretrained_backbone, map_location="cpu")
-            if isinstance(checkpoint, dict):
-                backbone_state_dict = checkpoint.get("backbone_state_dict", checkpoint)
-                spatial_pool_state_dict = checkpoint.get("spatial_pool_state_dict", None)
-            else:
-                backbone_state_dict = checkpoint
-                spatial_pool_state_dict = None
-
-            # Rimuovi prefissi
-            fixed_state_dict = {}
-            for k, v in backbone_state_dict.items():
-                if k.startswith("backbone."):
-                    fixed_state_dict[k[9:]] = v
+        # Forza l'uso di SpatialAttentionPool se richiesto esplicitamente
+        if use_spatial_attention is True:
+            self.spatial_pool = SpatialAttentionPool(in_channels=self._backbone_channels, embed_dim=EMBED_DIM)
+            self.use_spatial_attention = True
+        elif use_spatial_attention is False:
+            self.spatial_pool = nn.AdaptiveAvgPool2d(1)
+            self.use_spatial_attention = False
+        else:
+            # Comportamento originale: decide in base al checkpoint del backbone preaddestrato
+            if pretrained_backbone is not None:
+                checkpoint = torch.load(pretrained_backbone, map_location="cpu")
+                if isinstance(checkpoint, dict):
+                    backbone_state_dict = checkpoint.get("backbone_state_dict", checkpoint)
+                    spatial_pool_state_dict = checkpoint.get("spatial_pool_state_dict", None)
                 else:
-                    fixed_state_dict[k] = v
-            fixed_state_dict = {k: v for k, v in fixed_state_dict.items() if not k.startswith("fc.")}
-            self.backbone.load_state_dict(fixed_state_dict, strict=False)
+                    backbone_state_dict = checkpoint
+                    spatial_pool_state_dict = None
 
-            # Usa SpatialAttentionPool solo se presenti pesi preaddestrati
-            if spatial_pool_state_dict is not None:
-                self.spatial_pool = SpatialAttentionPool(in_channels=self._backbone_channels, embed_dim=EMBED_DIM)
-                self.spatial_pool.load_state_dict(spatial_pool_state_dict, strict=True)
-                for p in self.spatial_pool.parameters():
-                    p.requires_grad_(False)
-                self.spatial_pool.eval()
-                self.use_spatial_attention = True
+                # Rimuovi prefissi
+                fixed_state_dict = {}
+                for k, v in backbone_state_dict.items():
+                    if k.startswith("backbone."):
+                        fixed_state_dict[k[9:]] = v
+                    else:
+                        fixed_state_dict[k] = v
+                fixed_state_dict = {k: v for k, v in fixed_state_dict.items() if not k.startswith("fc.")}
+                self.backbone.load_state_dict(fixed_state_dict, strict=False)
+
+                # Usa SpatialAttentionPool solo se presenti pesi preaddestrati
+                if spatial_pool_state_dict is not None:
+                    self.spatial_pool = SpatialAttentionPool(in_channels=self._backbone_channels, embed_dim=EMBED_DIM)
+                    self.spatial_pool.load_state_dict(spatial_pool_state_dict, strict=True)
+                    for p in self.spatial_pool.parameters():
+                        p.requires_grad_(False)
+                    self.spatial_pool.eval()
+                    self.use_spatial_attention = True
+                else:
+                    self.spatial_pool = nn.AdaptiveAvgPool2d(1)
+                    self.use_spatial_attention = False
             else:
                 self.spatial_pool = nn.AdaptiveAvgPool2d(1)
                 self.use_spatial_attention = False
-        else:
-            self.spatial_pool = nn.AdaptiveAvgPool2d(1)
-            self.use_spatial_attention = False
 
         # Congela tutto il backbone
         for p in self.backbone.parameters():
@@ -1073,10 +1081,15 @@ def train(args, device, train_ds, val_ds):
 def load_checkpoint(checkpoint_path, device):
     print(f"[INFO] Caricamento checkpoint da: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    train_args = checkpoint.get('args', None)
-    policy_net = PolicyNetwork(HISTORY_LENGTH * N_ACTIONS, N_ACTIONS,
-                                pretrained_backbone=None).to(device)
-    policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
+    state_dict = checkpoint['policy_net_state_dict']
+    # Verifica se il modello salvato contiene SpatialAttentionPool
+    has_spatial = any(k.startswith('spatial_pool.') for k in state_dict.keys())
+    policy_net = PolicyNetwork(
+        HISTORY_LENGTH * N_ACTIONS, N_ACTIONS,
+        pretrained_backbone=None,
+        use_spatial_attention=has_spatial
+    ).to(device)
+    policy_net.load_state_dict(state_dict)
     print(f"[INFO] Checkpoint caricato da epoca {checkpoint['epoch']}")
     return policy_net, checkpoint
 
