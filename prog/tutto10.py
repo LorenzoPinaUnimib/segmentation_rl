@@ -182,6 +182,7 @@ class BatchedActiveLocalizationEnv:
         self.current_steps = torch.zeros(batch_size, dtype=torch.long, device=device)
         self.previous_ious = torch.zeros(batch_size, dtype=torch.float32, device=device)
         self.previous_gious = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        self.previous_dious = torch.zeros(batch_size, dtype=torch.float32, device=device)
         self.previous_dists = torch.zeros(batch_size, dtype=torch.float32, device=device)
         self.best_ious = torch.zeros(batch_size, dtype=torch.float32, device=device)
         self.best_boxes = torch.zeros((batch_size, 4), dtype=torch.float32, device=device)
@@ -228,6 +229,7 @@ class BatchedActiveLocalizationEnv:
         self.previous_dists = torch.norm(curr_centers - gt_centers, dim=1)
         self.previous_ious = compute_iou_tensor(self.boxes, self.gt_boxes)
         self.previous_gious = compute_giou_tensor(self.boxes, self.gt_boxes)
+        self.previous_dious = compute_diou_tensor(self.boxes, self.gt_boxes)
         self.best_ious = self.previous_ious.clone()
         self.best_boxes = self.boxes.clone()
         return self._get_obs()
@@ -304,10 +306,11 @@ class BatchedActiveLocalizationEnv:
         self.boxes[:, 3] = torch.clamp(self.boxes[:, 3] + dh, 10, self.H)
 
         new_ious = compute_iou_tensor(self.boxes, self.gt_boxes)
-        iou_diff = new_ious - self.previous_ious
 
         new_gious = compute_giou_tensor(self.boxes, self.gt_boxes)
         new_dious = compute_diou_tensor(self.boxes, self.gt_boxes)
+        
+        new_gious = compute_giou_tensor(self.boxes, self.gt_boxes)
         # 1. Shaping basato solo su GIoU (teoricamente fondato)
         giou_shaped = (GAMMA * new_gious) - self.previous_gious
         rewards = giou_shaped * 5.0
@@ -359,15 +362,17 @@ class BatchedActiveLocalizationEnv:
         
 
         self.previous_dists = curr_dists.clone()
-        self.previous_ious = new_ious
-        self.previous_gious = new_gious
 
+        '''
         improved = new_ious > self.best_ious
         if improved.any():
             self.best_ious[improved] = new_ious[improved]
             self.best_boxes[improved] = self.boxes[improved].clone()
-        '''
         truncated = (self.current_steps >= MAX_STEPS_PER_EPISODE)
+        #self.previous_ious = new_ious
+        #self.previous_gious = new_gious
+        #self.previous_dious = new_dious
+        
         return self._get_obs(), rewards, (terminated | truncated), new_ious, new_gious, new_dious
 
     def _simulate_move_boxes(self, boxes):
@@ -561,8 +566,7 @@ class QNetwork(nn.Module):
         x = self.shared(x)
         v = self.value_stream(x)
         a = self.advantage_stream(x)
-        q = v + (a - a.mean(dim=1, keepdim=True))
-        return q
+        return v + (a - a.mean(dim=1, keepdim=True))
 
 class PolicyNetwork(nn.Module):
     def __init__(self, history_dim, n_actions, pretrained_backbone=None, use_spatial_attention=None):
@@ -673,12 +677,14 @@ def validate(env, policy_net, val_indices, device, writer, global_step, epoch, n
     step_counts = torch.zeros(num_envs, device=device)   # conteggio passi per episodio (per media)
     active_mask = torch.ones(num_envs, dtype=torch.bool, device=device)
     last_iou_per_slot = torch.zeros(num_envs, device=device)
+    last_diou_per_slot = torch.zeros(num_envs, device=device)
+    last_giou_per_slot = torch.zeros(num_envs, device=device)
     final_ious = torch.zeros(num_envs, device=device)
     final_gious = torch.zeros(num_envs, device=device)
     final_dious = torch.zeros(num_envs, device=device)
 
     with torch.no_grad():
-        for step in range(MAX_STEPS_PER_EPISODE):
+        for _ in range(MAX_STEPS_PER_EPISODE):
             if not active_mask.any():
                 break
             q_values = policy_net(obs["regions"], obs["histories"], obs["extra"])
@@ -688,15 +694,16 @@ def validate(env, policy_net, val_indices, device, writer, global_step, epoch, n
             
             reward_sums[active_mask] += rewards[active_mask]
 
-            newly_done = active_mask & dones
-            final_ious[newly_done] = ious[newly_done]
-            final_gious[newly_done] = gious[newly_done]
-            final_dious[newly_done] = dious[newly_done]
-            active_mask = active_mask & (~dones)
-            last_iou_per_slot = torch.where(active_mask, ious, last_iou_per_slot)
-            last_diou_per_slot = torch.where(active_mask, dious, last_diou_per_slot)
-            last_giou_per_slot = torch.where(active_mask, gious, last_giou_per_slot)
-            obs = next_obs
+        newly_done = active_mask & dones
+        final_ious[newly_done]  = ious[newly_done]
+        final_gious[newly_done] = gious[newly_done]
+        final_dious[newly_done] = dious[newly_done]
+
+        active_mask = active_mask & (~dones)
+        last_iou_per_slot  = torch.where(active_mask, ious, last_iou_per_slot)
+        last_diou_per_slot = torch.where(active_mask, dious, last_diou_per_slot)
+        last_giou_per_slot = torch.where(active_mask, gious, last_giou_per_slot)
+        obs = next_obs
 
     if active_mask.any():
         final_ious[active_mask] = last_iou_per_slot[active_mask]
@@ -713,12 +720,12 @@ def validate(env, policy_net, val_indices, device, writer, global_step, epoch, n
     final_best_giou = final_gious.max().item()
     max_reward = reward_sums.max().item()
     max_step = step_counts.max().item()
-    final_std_iou = final_ious.std().item()
-    final_std_diou = final_dious.std().item()
-    final_std_giou = final_gious.std().item()
-    std_reward = reward_sums.std().item()
-    std_step = step_counts.std().item()
-    success_rate = (final_ious >= TAU_IOU).float().mean().item()
+    final_std_iou = final_ious.std(unbiased=False).item()
+    final_std_diou = final_dious.std(unbiased=False).item()
+    final_std_giou = final_gious.std(unbiased=False).item()
+    std_reward = reward_sums.std(unbiased=False).item()
+    std_step = step_counts.std(unbiased=False).item()
+    success_rate = (final_ious >= TAU_IOU).float().sum().item()
 
     print(f"[Epoch {epoch}] {tag} (fine episodio) - "
           f"Final IoU: {final_avg_iou:.4f}, Best IoU: {final_best_iou:.4f}, Success Rate: {success_rate:.4f}")
@@ -1023,13 +1030,13 @@ def train(args, device, train_ds, val_ds):
                 diou_active = dious[step_active_mask]
 
                 writer.add_scalar("Train/Step/IoU_mean", iou_active.mean().item(), global_step)
-                writer.add_scalar("Train/Step/IoU_std", iou_active.std().item(), global_step)
+                writer.add_scalar("Train/Step/IoU_std", iou_active.std(unbiased=False).item(), global_step)
                 writer.add_scalar("Train/Step/IoU_max", iou_active.max().item(), global_step)
                 writer.add_scalar("Train/Step/GIoU_mean", giou_active.mean().item(), global_step)
-                writer.add_scalar("Train/Step/GIoU_std", giou_active.std().item(), global_step)
+                writer.add_scalar("Train/Step/GIoU_std", giou_active.std(unbiased=False).item(), global_step)
                 writer.add_scalar("Train/Step/GIoU_max", giou_active.max().item(), global_step)
                 writer.add_scalar("Train/Step/DIoU_mean", diou_active.mean().item(), global_step)
-                writer.add_scalar("Train/Step/DIoU_std", diou_active.std().item(), global_step)
+                writer.add_scalar("Train/Step/DIoU_std", diou_active.std(unbiased=False).item(), global_step)
                 writer.add_scalar("Train/Step/DIoU_max", diou_active.max().item(), global_step)
 
                 writer.add_scalar("Train/Step/Epsilon", epsilon, global_step)
@@ -1043,7 +1050,6 @@ def train(args, device, train_ds, val_ds):
             last_iou_per_slot = torch.where(step_active_mask, ious.detach(), last_iou_per_slot)
             newly_done = step_active_mask & dones
             if newly_done.any():
-                epoch_final_ious.extend(ious[newly_done].detach().cpu().tolist())
                 done_indices = torch.where(newly_done)[0]
                 final_iou_new = ious[done_indices]
                 final_giou_new = gious[done_indices]
@@ -1056,26 +1062,9 @@ def train(args, device, train_ds, val_ds):
                 epoch_final_dious.extend(final_diou_new.cpu().tolist())
                 epoch_rewards.extend(final_reward_new.cpu().tolist())
                 epoch_steps.extend(final_step_new.cpu().tolist())
-                
 
             active_mask = active_mask & (~dones)
-            if active_mask.any():
-                # Calcola IoU, GIoU, DIoU finali per questi slot
-                last_boxes = train_env.boxes[active_mask]
-                last_gt = train_env.gt_boxes[active_mask]
-                last_iou = compute_iou_tensor(last_boxes, last_gt)
-                last_giou = compute_giou_tensor(last_boxes, last_gt)
-                last_diou = compute_diou_tensor(last_boxes, last_gt)
-                last_reward = reward_sums[active_mask]
-                last_step = step_counts[active_mask]
-                
-                epoch_final_ious.extend(last_iou.cpu().tolist())
-                epoch_final_gious.extend(last_giou.cpu().tolist())
-                epoch_final_dious.extend(last_diou.cpu().tolist())
-                epoch_rewards.extend(last_reward.cpu().tolist())
-                epoch_steps.extend(last_step.cpu().tolist())
             obs = next_obs
-
             # Aggiornamento Q-network
             if memory.size > args.batch_size * 10:
                 for _ in range(args.gradient_steps):
