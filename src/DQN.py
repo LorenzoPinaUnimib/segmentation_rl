@@ -205,7 +205,6 @@ class DQNAgent:
         self.action_size = action_size
 
         # Definisce la dimensione della memoria delle ultime esperienze
-        # TODO: testare aumento della memoria
         self.memory = deque(maxlen=10000) 
 
         # Quanto conta il futuro rispetto ad adesso

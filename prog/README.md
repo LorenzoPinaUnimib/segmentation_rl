@@ -7,6 +7,10 @@
 Abbiamo modificato più volte modello, reward, decadimento di epsilon, dimensione box iniziale del modello, spazio delle azioni (con o senza terminazione), modalità di acquisizione feature dall'immagine, tentato curriculum learning.
 Aggiungere parte su descrizione dataset.
 
+Descrivere sistemi estrazione featrure (niente, imagenet e pretrained)
+Descrivere varie tipologie di reward utilizzate (reward in base a iou e distanza, reward in base a iou, reward a step in base a iou)
+
+
 ## Indice
 
 1. [Introduzione e motivazione del problema](#1-introduzione-e-motivazione-del-problema)

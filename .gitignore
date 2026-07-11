@@ -11,3 +11,5 @@
 /progress*
 /checkpoint*/progress*.gif
 /checkpoint*/*.h5
+/test_gifs
+/ppo_logs
