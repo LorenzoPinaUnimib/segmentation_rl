@@ -28,6 +28,7 @@ from pathlib import Path
 import cv2
 import imageio
 import csv
+from itertools import cycle
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COSTANTI (solo quelle effettivamente usate)
@@ -126,6 +127,19 @@ def compute_diou_tensor(b1, b2):
     
     diou = iou - (rho2 / torch.clamp(c2, min=1e-6))
     return diou
+
+def _clamp_box(self, x1, y1, x2, y2):
+    x1 = torch.clamp(x1, 0, self.W)
+    y1 = torch.clamp(y1, 0, self.H)
+    x2 = torch.clamp(x2, 0, self.W)
+    y2 = torch.clamp(y2, 0, self.H)
+    x2 = torch.maximum(x2, x1 + 10)
+    y2 = torch.maximum(y2, y1 + 10)
+    x2 = torch.clamp(x2, max=self.W)
+    y2 = torch.clamp(y2, max=self.H)
+    x1 = torch.minimum(x1, x2 - 10)
+    y1 = torch.minimum(y1, y2 - 10)
+    return x1, y1, x2, y2
 
 class RunningMeanStd:
     """Stima online media/varianza per reward scaling."""
@@ -273,6 +287,19 @@ class BatchedActiveLocalizationEnv:
         x_c = boxes[:, 0] + boxes[:, 2] / 2
         y_c = boxes[:, 1] + boxes[:, 3] / 2
         return torch.stack([x_c, y_c], dim=1)
+    
+    def _clamp_box(self, x1, y1, x2, y2):
+        x1 = torch.clamp(x1, 0, self.W)
+        y1 = torch.clamp(y1, 0, self.H)
+        x2 = torch.clamp(x2, 0, self.W)
+        y2 = torch.clamp(y2, 0, self.H)
+        x2 = torch.maximum(x2, x1 + 10)
+        y2 = torch.maximum(y2, y1 + 10)
+        x2 = torch.clamp(x2, max=self.W)
+        y2 = torch.clamp(y2, max=self.H)
+        x1 = torch.minimum(x1, x2 - 10)
+        y1 = torch.minimum(y1, y2 - 10)
+        return x1, y1, x2, y2
 
     def step(self, actions):
         self.current_steps += 1
@@ -317,18 +344,11 @@ class BatchedActiveLocalizationEnv:
         # expand verticale (centrato): y1 arretra, y2 avanza
         dy1[m7] = -ah[m7]; dy2[m7] = ah[m7]
 
-        new_x1 = torch.clamp(self.boxes[:, 0] + dx1, 0, self.W)
-        new_y1 = torch.clamp(self.boxes[:, 1] + dy1, 0, self.H)
-        new_x2 = torch.clamp(self.boxes[:, 2] + dx2, 0, self.W)
-        new_y2 = torch.clamp(self.boxes[:, 3] + dy2, 0, self.H)
-
-        # garantisce larghezza/altezza minima 10 px senza invertire x1/x2 o y1/y2
-        new_x2 = torch.maximum(new_x2, new_x1 + 10)
-        new_y2 = torch.maximum(new_y2, new_y1 + 10)
-        new_x2 = torch.clamp(new_x2, max=self.W)
-        new_y2 = torch.clamp(new_y2, max=self.H)
-        new_x1 = torch.minimum(new_x1, new_x2 - 10)
-        new_y1 = torch.minimum(new_y1, new_y2 - 10)
+        new_x1 = self.boxes[:, 0] + dx1
+        new_y1 = self.boxes[:, 1] + dy1
+        new_x2 = self.boxes[:, 2] + dx2
+        new_y2 = self.boxes[:, 3] + dy2
+        new_x1, new_y1, new_x2, new_y2 = self._clamp_box(new_x1, new_y1, new_x2, new_y2)
 
         self.boxes[:, 0] = new_x1
         self.boxes[:, 1] = new_y1
@@ -397,10 +417,11 @@ class BatchedActiveLocalizationEnv:
         if improved.any():
             self.best_ious[improved] = new_ious[improved]
             self.best_boxes[improved] = self.boxes[improved].clone()
-        truncated = (self.current_steps >= MAX_STEPS_PER_EPISODE)
-        #self.previous_ious = new_ious
-        #self.previous_gious = new_gious
-        #self.previous_dious = new_dious
+        truncated = (self.current_steps >= MAX_STEPS_PER_EPISODE) & (~terminated)
+        rewards[truncated] -= 1.0 + 2.0 * torch.clamp(self.tau_iou - new_ious[truncated], min=0.0)
+        self.previous_ious = new_ious
+        self.previous_gious = new_gious
+        self.previous_dious = new_dious
         
         return self._get_obs(), rewards, (terminated | truncated), new_ious, new_gious, new_dious
 
@@ -431,15 +452,7 @@ class BatchedActiveLocalizationEnv:
             new_x2 = boxes[:, 2] + dx2
             new_y2 = boxes[:, 3] + dy2
 
-            # clamp coordinate ai bordi immagine
-            new_x1 = torch.clamp(new_x1, 0, self.W)
-            new_y1 = torch.clamp(new_y1, 0, self.H)
-            new_x2 = torch.clamp(new_x2, 0, self.W)
-            new_y2 = torch.clamp(new_y2, 0, self.H)
-
-            # garantisci larghezza/altezza minima 10, senza spostare l'estremo opposto
-            new_x2 = torch.maximum(new_x2, new_x1 + 10)
-            new_y2 = torch.maximum(new_y2, new_y1 + 10)
+            new_x1, new_y1, new_x2, new_y2 = self._clamp_box(new_x1, new_y1, new_x2, new_y2)
 
             nb = boxes.clone()
             nb[:, 0] = new_x1
@@ -599,16 +612,22 @@ class QNetwork(nn.Module):
             nn.Linear(input_dim, hidden),
             nn.LayerNorm(hidden),
             nn.ReLU(),
+            nn.Dropout(p=0.5),          # <-- aggiungi dropout
             nn.Linear(hidden, hidden),
             nn.LayerNorm(hidden),
             nn.ReLU(),
+            nn.Dropout(p=0.5),          # <-- aggiungi dropout
         )
         self.value_stream = nn.Sequential(
-            nn.Linear(hidden, hidden // 2), nn.ReLU(),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(p=0.3),          # <-- aggiungi dropout
             nn.Linear(hidden // 2, 1)
         )
         self.advantage_stream = nn.Sequential(
-            nn.Linear(hidden, hidden // 2), nn.ReLU(),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(p=0.3),          # <-- aggiungi dropout
             nn.Linear(hidden // 2, n_actions)
         )
 
@@ -745,16 +764,16 @@ def validate(env, policy_net, val_indices, device, writer, global_step, epoch, n
             
             reward_sums[active_mask] += rewards[active_mask]
 
-        newly_done = active_mask & dones
-        final_ious[newly_done]  = ious[newly_done]
-        final_gious[newly_done] = gious[newly_done]
-        final_dious[newly_done] = dious[newly_done]
+            newly_done = active_mask & dones
+            final_ious[newly_done]  = ious[newly_done]
+            final_gious[newly_done] = gious[newly_done]
+            final_dious[newly_done] = dious[newly_done]
 
-        active_mask = active_mask & (~dones)
-        last_iou_per_slot  = torch.where(active_mask, ious, last_iou_per_slot)
-        last_diou_per_slot = torch.where(active_mask, dious, last_diou_per_slot)
-        last_giou_per_slot = torch.where(active_mask, gious, last_giou_per_slot)
-        obs = next_obs
+            active_mask = active_mask & (~dones)
+            last_iou_per_slot  = torch.where(active_mask, ious, last_iou_per_slot)
+            last_diou_per_slot = torch.where(active_mask, dious, last_diou_per_slot)
+            last_giou_per_slot = torch.where(active_mask, gious, last_giou_per_slot)
+            obs = next_obs
 
     if active_mask.any():
         final_ious[active_mask] = last_iou_per_slot[active_mask]
@@ -776,7 +795,7 @@ def validate(env, policy_net, val_indices, device, writer, global_step, epoch, n
     final_std_giou = final_gious.std(unbiased=False).item()
     std_reward = reward_sums.std(unbiased=False).item()
     std_step = step_counts.std(unbiased=False).item()
-    success_rate = (final_ious >= TAU_IOU).float().sum().item()
+    success_rate = (final_ious >= TAU_IOU).float().mean().item()
 
     print(f"[Epoch {epoch}] {tag} (fine episodio) - "
           f"Final IoU: {final_avg_iou:.4f}, Best IoU: {final_best_iou:.4f}, Success Rate: {success_rate:.4f}")
@@ -879,6 +898,20 @@ class NStepAccumulator:
     def reset_slot(self, slot):
         self.queues[slot].clear()
 
+def cyclic_batch_indices(dataset_size, batch_size, shuffle=True):
+    indices = np.arange(dataset_size)
+    while True:
+        if shuffle:
+            np.random.shuffle(indices)
+        for start in range(0, dataset_size, batch_size):
+            batch = indices[start:start + batch_size]
+            if len(batch) < batch_size:
+                # Se l'ultimo batch è incompleto, lo riempi con campioni casuali (opzionale)
+                # Oppure lo tronchi (ma poi devi gestire batch di dimensione variabile)
+                # Io consiglio di riempirlo per mantenere batch_size costante
+                extra = np.random.choice(indices, size=batch_size - len(batch), replace=True)
+                batch = np.concatenate([batch, extra])
+            yield batch
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. TRAINING LOOP (semplificato)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -908,6 +941,8 @@ def train(args, device, train_ds, val_ds):
     optimizer = optim.AdamW(policy_net.head.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
     total_training_steps = args.n_epochs * MAX_STEPS_PER_EPISODE
+    if args.epsilon_decay_steps is None:
+        args.epsilon_decay_steps = max(1, int(total_training_steps * 0.3))
     total_optimizer_steps = max(total_training_steps * args.gradient_steps, 1)
     warmup_steps = max(int(0.05 * total_optimizer_steps), 1)
     warmup_scheduler = optim.lr_scheduler.LinearLR(
@@ -947,10 +982,10 @@ def train(args, device, train_ds, val_ds):
     def get_epsilon(step, total_steps):
         decay_steps = max(1, args.epsilon_decay_steps)
         return EPSILON_END + (EPSILON_START - EPSILON_END) * np.exp(-1.0 * step / decay_steps)
-
+    
     def get_teacher_prob(epoch):
-        ramp = args.curriculum_ramp_frac
-        return max(args.teacher_prob_floor, 1.0 - min(1.0, epoch / (args.n_epochs * ramp)))
+        # Decadimento esponenziale più veloce
+        return max(args.teacher_prob_floor, EPSILON_END + (1.0 - EPSILON_END)* math.exp(-epoch / 20))
 
     def get_tau_iou(epoch):
         if not args.use_tau_curriculum:
@@ -984,7 +1019,9 @@ def train(args, device, train_ds, val_ds):
 
     print("[INFO] Inizio training..." if args.model is None else "[INFO] Ripresa training...")
     print("=" * 80)
-
+    
+    batch_generator = cyclic_batch_indices(len(train_ds), args.batch_size, shuffle=True)
+    batch_generator_val = cyclic_batch_indices(len(val_ds), args.batch_size, shuffle=True)
     for epoch in range(start_epoch, args.n_epochs):
         
         reward_sums = torch.zeros(args.batch_size, device=device)   # reward cumulativa per slot
@@ -1012,7 +1049,9 @@ def train(args, device, train_ds, val_ds):
         reward_sums = torch.zeros(args.batch_size, device=device)
         step_counts = torch.zeros(args.batch_size, device=device)
 
-        train_indices = np.random.choice(len(train_ds), size=args.batch_size, replace=True)
+        #train_indices = np.random.choice(len(train_ds), size=args.batch_size, replace=True)
+        #obs = train_env.reset_all(train_indices)
+        train_indices = next(batch_generator)   # ottieni il prossimo batch
         obs = train_env.reset_all(train_indices)
 
         active_mask = torch.ones(args.batch_size, dtype=torch.bool, device=device)
@@ -1134,7 +1173,11 @@ def train(args, device, train_ds, val_ds):
                     q_vals = q_all.gather(1, b_act.unsqueeze(1)).squeeze(1)
 
                     with torch.no_grad():
+                        # --- FIX: selezione dell'azione (Double DQN) senza dropout ---
+                        policy_net.eval()
                         next_actions = policy_net(b_ns, b_nhist, b_nextra).argmax(dim=1, keepdim=True)
+                        policy_net.train()  # ripristino stato per coerenza col resto del loop
+                        # ---------------------------------------------------------------
                         next_q_vals = target_net(b_ns, b_nhist, b_nextra).gather(1, next_actions).squeeze(1)
                         target_q = b_rew + (n_step_gamma * next_q_vals * (1.0 - b_term))
 
@@ -1282,8 +1325,10 @@ def train(args, device, train_ds, val_ds):
 
         # --- VALIDAZIONE ---
         print(f"\n[Epoch {epoch+1}] Validazione in corso...")
-        val_indices = np.random.choice(len(val_ds), size=min(args.batch_size, len(val_ds)), replace=False)
-        val_indices = np.pad(val_indices, (0, args.batch_size - len(val_indices)), 'wrap')
+       # val_indices = np.random.choice(len(val_ds), size=min(args.batch_size, len(val_ds)), replace=False)
+        #val_indices = np.pad(val_indices, (0, args.batch_size - len(val_indices)), 'wrap')
+        
+        val_indices = next(batch_generator_val)   # ottieni il prossimo batch
 
         val_metrics = validate(
             val_env, policy_net, val_indices, device, writer, global_step, epoch + 1, args.n_epochs
@@ -1436,7 +1481,7 @@ def run_test(args, device, test_ds):
 
                 cv2.putText(frame, f"IoU: {final_iou:.3f}", (5, 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-                cv2.putText(frame, "Giallo=GT  Verde=movimento  Rosso=trigger", (5, img.shape[0] - 8),
+                cv2.putText(frame, f"rew:{rewards[0].item():.3f}", (5, img.shape[0] - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
                 frames.append(frame)
 
@@ -1596,7 +1641,7 @@ if __name__ == "__main__":
     # Iperparametri RL (con valori di default)
     parser.add_argument("--target-tau", type=float, default=0.01)
     parser.add_argument("--gradient-steps", type=int, default=2)
-    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--use-per", action="store_true", default=True)
     parser.add_argument("--no-per", dest="use_per", action="store_false")
     parser.add_argument("--per-alpha", type=float, default=PER_ALPHA)
@@ -1608,14 +1653,14 @@ if __name__ == "__main__":
     parser.add_argument("--use-tau-curriculum", action="store_true", default=True)
     parser.add_argument("--no-tau-curriculum", dest="use_tau_curriculum", action="store_false")
     parser.add_argument("--tau-iou-start", type=float, default=0.4)
-    parser.add_argument("--epsilon-decay-steps", type=int, default=2500)
+    parser.add_argument("--epsilon-decay-steps", type=int, default=None)
     parser.add_argument("--use-dqfd-margin", action="store_true", default=True)
     parser.add_argument("--no-dqfd-margin", dest="use_dqfd_margin", action="store_false")
     parser.add_argument("--dqfd-margin", type=float, default=0.8)
     parser.add_argument("--dqfd-lambda", type=float, default=1.0)
 
     args = parser.parse_args()
-
+    
     # Device
     if args.device == "auto":
         try:
