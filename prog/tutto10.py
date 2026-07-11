@@ -8,7 +8,7 @@ buffer immagini, validazione infra-epoca, ecc.).
 Le metriche si basano esclusivamente sull'ultima iterazione di ogni episodio (trigger o timeout).
 Durante il training, nel progress bar e nei log viene mostrato l'IoU dello step corrente.
 """
-
+import gc
 import os
 import copy
 import math
@@ -646,7 +646,7 @@ class PolicyNetwork(nn.Module):
         else:
             # Comportamento originale: decide in base al checkpoint del backbone preaddestrato
             if pretrained_backbone is not None:
-                checkpoint = torch.load(pretrained_backbone, map_location="cpu")
+                checkpoint = torch.load(pretrained_backbone, map_location="cpu", weights_only=False)
                 if isinstance(checkpoint, dict):
                     backbone_state_dict = checkpoint.get("backbone_state_dict", checkpoint)
                     spatial_pool_state_dict = checkpoint.get("spatial_pool_state_dict", None)
@@ -932,7 +932,7 @@ def train(args, device, train_ds, val_ds):
     best_iou = 0.0
     if args.model is not None:
         print(f"\n[INFO] --model fornito: riprendo il training da '{args.model}'")
-        checkpoint = torch.load(args.model, map_location="cpu")
+        checkpoint = torch.load(args.model, map_location="cpu", weights_only=False)
         policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
         target_net.load_state_dict(checkpoint.get('target_net_state_dict', policy_net.state_dict()))
         start_epoch = checkpoint.get('epoch', 0)
@@ -1339,6 +1339,7 @@ def train(args, device, train_ds, val_ds):
         print("=" * 80)
         if device.type == 'mps':
             torch.mps.empty_cache()
+            gc.collect()
 
     print("\n" + "=" * 80)
     print("[INFO] Training completato!")
@@ -1351,7 +1352,7 @@ def train(args, device, train_ds, val_ds):
 # ─────────────────────────────────────────────────────────────────────────────
 def load_checkpoint(checkpoint_path, device):
     print(f"[INFO] Caricamento checkpoint da: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = checkpoint['policy_net_state_dict']
     # Verifica se il modello salvato contiene SpatialAttentionPool
     has_spatial = any(k.startswith('spatial_pool.') for k in state_dict.keys())
