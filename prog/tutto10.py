@@ -363,7 +363,7 @@ class BatchedActiveLocalizationEnv:
         # 1. Shaping basato solo su GIoU (teoricamente fondato)
         giou_shaped = (GAMMA * new_dious) - self.previous_dious
         rewards = giou_shaped * 5.0
-
+        rewards = rewards - 0.02
         # 2. Piccola penalità per stallo/loop combinata
         iou_delta = new_ious - self.previous_ious
         stall_penalty = torch.where(
@@ -377,8 +377,8 @@ class BatchedActiveLocalizationEnv:
         terminated = (actions == 8)
         rewards[terminated] = torch.where(
             new_ious[terminated] >= self.tau_iou,
-            5.0 + 20.0 * (new_ious[terminated] - self.tau_iou),  # bonus fino a 11
-            -5.0 - 20.0 * (self.tau_iou - new_ious[terminated])   # penalità fino a -13
+            5.0 + 10.0 * (new_ious[terminated] - self.tau_iou),  # bonus fino a 11
+            -3.0 - 5.0 * (self.tau_iou - new_ious[terminated])   # penalità fino a -13
         )
 
         # 4. Nessuna penalità di regressione
@@ -612,22 +612,22 @@ class QNetwork(nn.Module):
             nn.Linear(input_dim, hidden),
             nn.LayerNorm(hidden),
             nn.ReLU(),
-            nn.Dropout(p=0.5),          # <-- aggiungi dropout
+            nn.Dropout(p=0.2),          # <-- aggiungi dropout
             nn.Linear(hidden, hidden),
             nn.LayerNorm(hidden),
             nn.ReLU(),
-            nn.Dropout(p=0.5),          # <-- aggiungi dropout
+            nn.Dropout(p=0.1),          # <-- aggiungi dropout
         )
         self.value_stream = nn.Sequential(
             nn.Linear(hidden, hidden // 2),
             nn.ReLU(),
-            nn.Dropout(p=0.3),          # <-- aggiungi dropout
+            nn.Dropout(p=0.1),          # <-- aggiungi dropout
             nn.Linear(hidden // 2, 1)
         )
         self.advantage_stream = nn.Sequential(
             nn.Linear(hidden, hidden // 2),
             nn.ReLU(),
-            nn.Dropout(p=0.3),          # <-- aggiungi dropout
+            nn.Dropout(p=0.1),          # <-- aggiungi dropout
             nn.Linear(hidden // 2, n_actions)
         )
 
@@ -643,10 +643,7 @@ class PolicyNetwork(nn.Module):
         super().__init__()
         from torchvision.models import resnet18, ResNet18_Weights
 
-        if pretrained_backbone is not None:
-            weights = None
-        else:
-            weights = ResNet18_Weights.DEFAULT
+        weights = None if pretrained_backbone is not None else ResNet18_Weights.DEFAULT
 
         backbone = resnet18(weights=weights)
         backbone.avgpool = nn.Identity()
@@ -716,10 +713,7 @@ class PolicyNetwork(nn.Module):
         return pooled.view(b, self._backbone_channels)
 
     def forward(self, regions, histories, extra_feats):
-        if regions.dim() == 4:
-            embeds = self.embed_regions(regions)
-        else:
-            embeds = regions  # assume già embedding
+        embeds = self.embed_regions(regions) if regions.dim() == 4 else regions
         return self.head(embeds, histories, extra_feats)
 
     def set_inference_mode(self):
@@ -973,19 +967,44 @@ def train(args, device, train_ds, val_ds):
         start_epoch = checkpoint.get('epoch', 0)
         global_step = checkpoint.get('global_step', 0)
         best_iou = checkpoint.get('best_iou', 0.0)
+
+        # Ripristina lo stato dell'ottimizzatore, per non perdere i momenti (Adam)
+        if 'optimizer_state_dict' in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print("  [✓] Stato optimizer ripristinato")
+            except Exception as e:
+                print(f"  [!] Impossibile ripristinare l'optimizer: {e}")
+
+        # Ripristina lo stato dello scheduler, per continuare la curva LR (warmup+cosine)
+        if 'scheduler_state_dict' in checkpoint:
+            try:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                print("  [✓] Stato scheduler ripristinato")
+            except Exception as e:
+                print(f"  [!] Impossibile ripristinare lo scheduler: {e}")
+
+        # Ripristina il reward scaler (media/varianza online)
+        if 'reward_scaler_state' in checkpoint:
+            try:
+                reward_scaler.load_state_dict(checkpoint['reward_scaler_state'])
+                print("  [✓] Stato reward_scaler ripristinato")
+            except Exception as e:
+                print(f"  [!] Impossibile ripristinare il reward_scaler: {e}")
+
         print(f"  [✓] Ripresa da epoca {start_epoch}, global_step={global_step}, best_iou={best_iou:.4f}")
         if start_epoch >= args.n_epochs:
             print("[INFO] Epoca di partenza già >= --n-epochs: fine.")
             writer.close()
             return checkpoint_dir, best_iou
-
+        
     def get_epsilon(step, total_steps):
         decay_steps = max(1, args.epsilon_decay_steps)
         return EPSILON_END + (EPSILON_START - EPSILON_END) * np.exp(-1.0 * step / decay_steps)
     
     def get_teacher_prob(epoch):
         # Decadimento esponenziale più veloce
-        return max(args.teacher_prob_floor, EPSILON_END + (1.0 - EPSILON_END)* math.exp(-epoch / 20))
+        return max(args.teacher_prob_floor, EPSILON_END + (1.0 - EPSILON_END)* math.exp(-epoch / 50))
 
     def get_tau_iou(epoch):
         if not args.use_tau_curriculum:
@@ -1089,9 +1108,9 @@ def train(args, device, train_ds, val_ds):
 
             next_obs, rewards, dones, ious, gious, dious = train_env.step(actions)
             # Aggiorna accumulatori per gli slot attivi
+            rewards = torch.clamp(rewards, -REWARD_CLIP, REWARD_CLIP)
             reward_sums[active_mask] += rewards[active_mask]
             step_counts[active_mask] += 1
-            rewards = torch.clamp(rewards, -REWARD_CLIP, REWARD_CLIP)
 
             step_active_mask = active_mask.clone()
             n_active = int(step_active_mask.sum().item())
@@ -1366,6 +1385,8 @@ def train(args, device, train_ds, val_ds):
             'best_iou': max(best_iou, val_final_iou),
             'args': args,
             'reward_scaler_state': reward_scaler.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
         }
 
         # Salvataggio checkpoint come prima...
