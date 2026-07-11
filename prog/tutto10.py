@@ -341,7 +341,7 @@ class BatchedActiveLocalizationEnv:
         new_dious = compute_diou_tensor(self.boxes, self.gt_boxes)
         
         # 1. Shaping basato solo su GIoU (teoricamente fondato)
-        giou_shaped = (GAMMA * new_gious) - self.previous_gious
+        giou_shaped = (GAMMA * new_dious) - self.previous_dious
         rewards = giou_shaped * 5.0
 
         # 2. Piccola penalità per stallo/loop combinata
@@ -1337,6 +1337,8 @@ def train(args, device, train_ds, val_ds):
         latest_checkpoint_path = os.path.join(checkpoint_dir, "latest_checkpoint.pt")
         torch.save(checkpoint, latest_checkpoint_path)
         print("=" * 80)
+        if device.type == 'mps':
+            torch.mps.empty_cache()
 
     print("\n" + "=" * 80)
     print("[INFO] Training completato!")
