@@ -65,38 +65,42 @@ REWARD_SCALING_EPS = 1e-6
 # 1. UTILITY FUNCTIONS (GPU)
 # ─────────────────────────────────────────────────────────────────────────────
 def compute_iou_tensor(b1, b2):
+    # b1, b2: [N, 4] (x1, y1, x2, y2)
     xi1 = torch.max(b1[:, 0], b2[:, 0])
     yi1 = torch.max(b1[:, 1], b2[:, 1])
-    xi2 = torch.min(b1[:, 0] + b1[:, 2], b2[:, 0] + b2[:, 2])
-    yi2 = torch.min(b1[:, 1] + b1[:, 3], b2[:, 1] + b2[:, 3])
+    xi2 = torch.min(b1[:, 2], b2[:, 2])
+    yi2 = torch.min(b1[:, 3], b2[:, 3])
     inter_area = torch.clamp(xi2 - xi1, min=0) * torch.clamp(yi2 - yi1, min=0)
-    union_area = (b1[:, 2] * b1[:, 3]) + (b2[:, 2] * b2[:, 3]) - inter_area
+    area1 = torch.clamp(b1[:, 2] - b1[:, 0], min=0) * torch.clamp(b1[:, 3] - b1[:, 1], min=0)
+    area2 = torch.clamp(b2[:, 2] - b2[:, 0], min=0) * torch.clamp(b2[:, 3] - b2[:, 1], min=0)
+    union_area = area1 + area2 - inter_area
     return inter_area / torch.clamp(union_area, min=1e-6)
 
 def compute_giou_tensor(b1, b2):
+    # b1, b2: [N, 4] (x1, y1, x2, y2)
     xi1 = torch.max(b1[:, 0], b2[:, 0])
     yi1 = torch.max(b1[:, 1], b2[:, 1])
-    xi2 = torch.min(b1[:, 0] + b1[:, 2], b2[:, 0] + b2[:, 2])
-    yi2 = torch.min(b1[:, 1] + b1[:, 3], b2[:, 1] + b2[:, 3])
+    xi2 = torch.min(b1[:, 2], b2[:, 2])
+    yi2 = torch.min(b1[:, 3], b2[:, 3])
     inter_area = torch.clamp(xi2 - xi1, min=0) * torch.clamp(yi2 - yi1, min=0)
-    area1 = b1[:, 2] * b1[:, 3]
-    area2 = b2[:, 2] * b2[:, 3]
+    area1 = torch.clamp(b1[:, 2] - b1[:, 0], min=0) * torch.clamp(b1[:, 3] - b1[:, 1], min=0)
+    area2 = torch.clamp(b2[:, 2] - b2[:, 0], min=0) * torch.clamp(b2[:, 3] - b2[:, 1], min=0)
     union_area = area1 + area2 - inter_area
     iou = inter_area / torch.clamp(union_area, min=1e-6)
     cx1 = torch.min(b1[:, 0], b2[:, 0])
     cy1 = torch.min(b1[:, 1], b2[:, 1])
-    cx2 = torch.max(b1[:, 0] + b1[:, 2], b2[:, 0] + b2[:, 2])
-    cy2 = torch.max(b1[:, 1] + b1[:, 3], b2[:, 1] + b2[:, 3])
+    cx2 = torch.max(b1[:, 2], b2[:, 2])
+    cy2 = torch.max(b1[:, 3], b2[:, 3])
     enclose_area = torch.clamp(cx2 - cx1, min=0) * torch.clamp(cy2 - cy1, min=0)
     return iou - (enclose_area - union_area) / torch.clamp(enclose_area, min=1e-6)
 
 def compute_diou_tensor(b1, b2):
-    # b1, b2: [N, 4] (x, y, w, h)
+    # b1, b2: [N, 4] (x1, y1, x2, y2)
     # Center points
-    c1_x = b1[:, 0] + b1[:, 2] / 2
-    c1_y = b1[:, 1] + b1[:, 3] / 2
-    c2_x = b2[:, 0] + b2[:, 2] / 2
-    c2_y = b2[:, 1] + b2[:, 3] / 2
+    c1_x = (b1[:, 0] + b1[:, 2]) / 2
+    c1_y = (b1[:, 1] + b1[:, 3]) / 2
+    c2_x = (b2[:, 0] + b2[:, 2]) / 2
+    c2_y = (b2[:, 1] + b2[:, 3]) / 2
     
     # Euclidean distance squared between centers
     rho2 = (c1_x - c2_x)**2 + (c1_y - c2_y)**2
@@ -105,17 +109,19 @@ def compute_diou_tensor(b1, b2):
     # smallest enclosing box: min x1, min y1, max x2, max y2
     x1_min = torch.min(b1[:, 0], b2[:, 0])
     y1_min = torch.min(b1[:, 1], b2[:, 1])
-    x2_max = torch.max(b1[:, 0] + b1[:, 2], b2[:, 0] + b2[:, 2])
-    y2_max = torch.max(b1[:, 1] + b1[:, 3], b2[:, 1] + b2[:, 3])
+    x2_max = torch.max(b1[:, 2], b2[:, 2])
+    y2_max = torch.max(b1[:, 3], b2[:, 3])
     c2 = (x2_max - x1_min)**2 + (y2_max - y1_min)**2
     
     # IoU
     xi1 = torch.max(b1[:, 0], b2[:, 0])
     yi1 = torch.max(b1[:, 1], b2[:, 1])
-    xi2 = torch.min(b1[:, 0] + b1[:, 2], b2[:, 0] + b2[:, 2])
-    yi2 = torch.min(b1[:, 1] + b1[:, 3], b2[:, 1] + b2[:, 3])
+    xi2 = torch.min(b1[:, 2], b2[:, 2])
+    yi2 = torch.min(b1[:, 3], b2[:, 3])
     inter = torch.clamp(xi2 - xi1, min=0) * torch.clamp(yi2 - yi1, min=0)
-    union = (b1[:, 2]*b1[:, 3]) + (b2[:, 2]*b2[:, 3]) - inter
+    area1 = torch.clamp(b1[:, 2] - b1[:, 0], min=0) * torch.clamp(b1[:, 3] - b1[:, 1], min=0)
+    area2 = torch.clamp(b2[:, 2] - b2[:, 0], min=0) * torch.clamp(b2[:, 3] - b2[:, 1], min=0)
+    union = area1 + area2 - inter
     iou = inter / torch.clamp(union, min=1e-6)
     
     diou = iou - (rho2 / torch.clamp(c2, min=1e-6))
@@ -199,17 +205,18 @@ class BatchedActiveLocalizationEnv:
         if len(pos[0]) > 0:
             ymin, ymax = torch.min(pos[0]), torch.max(pos[0])
             xmin, xmax = torch.min(pos[1]), torch.max(pos[1])
+            # gt_boxes in formato (x1, y1, x2, y2)
             self.gt_boxes[slot] = torch.tensor(
-                [xmin.float(), ymin.float(), (xmax - xmin).float(), (ymax - ymin).float()],
+                [xmin.float(), ymin.float(), xmax.float(), ymax.float()],
                 dtype=torch.float32, device=self.device
             )
         else:
             self.gt_boxes[slot] = torch.tensor(
-                [self.W / 4, self.H / 4, self.W / 2, self.H / 2],
+                [self.W / 4, self.H / 4, 3 * self.W / 4, 3 * self.H / 4],
                 dtype=torch.float32, device=self.device
             )
 
-        # box iniziale = immagine intera
+        # box iniziale = immagine intera (x1, y1, x2, y2)
         self.boxes[slot, 0] = 0.0
         self.boxes[slot, 1] = 0.0
         self.boxes[slot, 2] = float(self.W)
@@ -235,17 +242,17 @@ class BatchedActiveLocalizationEnv:
         return self._get_obs()
 
     def _get_obs(self):
-        x, y, w, h = self.boxes[:, 0], self.boxes[:, 1], self.boxes[:, 2], self.boxes[:, 3]
+        x1, y1, x2, y2 = self.boxes[:, 0], self.boxes[:, 1], self.boxes[:, 2], self.boxes[:, 3]
 
-        x1 = torch.clamp(x - CONTEXT_PIXELS, min=0, max=float(self.W))
-        y1 = torch.clamp(y - CONTEXT_PIXELS, min=0, max=float(self.H))
-        x2 = torch.clamp(x + w + CONTEXT_PIXELS, min=0, max=float(self.W))
-        y2 = torch.clamp(y + h + CONTEXT_PIXELS, min=0, max=float(self.H))
-        x2 = torch.maximum(x2, x1 + 1.0)
-        y2 = torch.maximum(y2, y1 + 1.0)
+        rx1 = torch.clamp(x1 - CONTEXT_PIXELS, min=0, max=float(self.W))
+        ry1 = torch.clamp(y1 - CONTEXT_PIXELS, min=0, max=float(self.H))
+        rx2 = torch.clamp(x2 + CONTEXT_PIXELS, min=0, max=float(self.W))
+        ry2 = torch.clamp(y2 + CONTEXT_PIXELS, min=0, max=float(self.H))
+        rx2 = torch.maximum(rx2, rx1 + 1.0)
+        ry2 = torch.maximum(ry2, ry1 + 1.0)
 
         batch_idx = torch.arange(self.num_envs, device=self.device, dtype=torch.float32)
-        rois = torch.stack([batch_idx, x1, y1, x2, y2], dim=1)
+        rois = torch.stack([batch_idx, rx1, ry1, rx2, ry2], dim=1)
 
         regions = roi_align(
             self.current_images, rois, output_size=WARP_SIZE,
@@ -253,10 +260,10 @@ class BatchedActiveLocalizationEnv:
         )
 
         extra = torch.stack([
-            x / float(self.W),
-            y / float(self.H),
-            w / float(self.W),
-            h / float(self.H),
+            x1 / float(self.W),
+            y1 / float(self.H),
+            x2 / float(self.W),
+            y2 / float(self.H),
             self.current_steps.float() / float(MAX_STEPS_PER_EPISODE),
         ], dim=1)
 
@@ -280,37 +287,59 @@ class BatchedActiveLocalizationEnv:
         self.one_hot_buffer.scatter_(1, actions.unsqueeze(1), 1.0)
         self.histories = torch.cat([self.histories[:, N_ACTIONS:], self.one_hot_buffer], dim=1)
 
-        w, h = self.boxes[:, 2], self.boxes[:, 3]
+        # w, h derivati dal box corrente (x1, y1, x2, y2)
+        w, h = self.boxes[:, 2] - self.boxes[:, 0], self.boxes[:, 3] - self.boxes[:, 1]
         aw, ah = ALPHA * w, ALPHA * h
-
-        dx = torch.zeros(self.num_envs, device=self.device)
-        dy = torch.zeros(self.num_envs, device=self.device)
-        dw = torch.zeros(self.num_envs, device=self.device)
-        dh = torch.zeros(self.num_envs, device=self.device)
+ # delta espliciti sui 4 estremi (x1, y1, x2, y2)
+        dx1 = torch.zeros(self.num_envs, device=self.device)
+        dy1 = torch.zeros(self.num_envs, device=self.device)
+        dx2 = torch.zeros(self.num_envs, device=self.device)
+        dy2 = torch.zeros(self.num_envs, device=self.device)
 
         m0 = (actions == 0); m1 = (actions == 1); m2 = (actions == 2); m3 = (actions == 3)
         m4 = (actions == 4); m5 = (actions == 5); m6 = (actions == 6); m7 = (actions == 7)
 
-        dx[m0] = aw[m0];          dx[m1] = -aw[m1]
-        dy[m2] = -ah[m2];         dy[m3] = ah[m3]
+        # traslazione destra/sinistra: entrambi gli estremi x si spostano insieme
+        dx1[m0] = aw[m0]; dx2[m0] = aw[m0]
+        dx1[m1] = -aw[m1]; dx2[m1] = -aw[m1]
 
-        dx[m4] = -aw[m4]; dy[m4] = -ah[m4]; dw[m4] = 2*aw[m4]; dh[m4] = 2*ah[m4]
-        dx[m5] = aw[m5];  dy[m5] = ah[m5];  dw[m5] = -2*aw[m5]; dh[m5] = -2*ah[m5]
+        # traslazione su/giù: entrambi gli estremi y si spostano insieme
+        dy1[m2] = -ah[m2]; dy2[m2] = -ah[m2]
+        dy1[m3] = ah[m3]; dy2[m3] = ah[m3]
 
-        dx[m6] = -aw[m6]; dw[m6] = 2*aw[m6]
-        dy[m7] = -ah[m7]; dh[m7] = 2*ah[m7]
+        # shrink orizzontale (centrato sull'asse x): x1 avanza, x2 arretra
+        dx1[m4] = aw[m4]; dx2[m4] = -aw[m4]
+        # shrink verticale (centrato sull'asse y): y1 avanza, y2 arretra
+        dy1[m5] = ah[m5]; dy2[m5] = -ah[m5]
 
-        self.boxes[:, 0] = torch.clamp(self.boxes[:, 0] + dx, 0, self.W - 1)
-        self.boxes[:, 1] = torch.clamp(self.boxes[:, 1] + dy, 0, self.H - 1)
-        self.boxes[:, 2] = torch.clamp(self.boxes[:, 2] + dw, 10, self.W)
-        self.boxes[:, 3] = torch.clamp(self.boxes[:, 3] + dh, 10, self.H)
+        # expand orizzontale (centrato): x1 arretra, x2 avanza
+        dx1[m6] = -aw[m6]; dx2[m6] = aw[m6]
+        # expand verticale (centrato): y1 arretra, y2 avanza
+        dy1[m7] = -ah[m7]; dy2[m7] = ah[m7]
+
+        new_x1 = torch.clamp(self.boxes[:, 0] + dx1, 0, self.W)
+        new_y1 = torch.clamp(self.boxes[:, 1] + dy1, 0, self.H)
+        new_x2 = torch.clamp(self.boxes[:, 2] + dx2, 0, self.W)
+        new_y2 = torch.clamp(self.boxes[:, 3] + dy2, 0, self.H)
+
+        # garantisce larghezza/altezza minima 10 px senza invertire x1/x2 o y1/y2
+        new_x2 = torch.maximum(new_x2, new_x1 + 10)
+        new_y2 = torch.maximum(new_y2, new_y1 + 10)
+        new_x2 = torch.clamp(new_x2, max=self.W)
+        new_y2 = torch.clamp(new_y2, max=self.H)
+        new_x1 = torch.minimum(new_x1, new_x2 - 10)
+        new_y1 = torch.minimum(new_y1, new_y2 - 10)
+
+        self.boxes[:, 0] = new_x1
+        self.boxes[:, 1] = new_y1
+        self.boxes[:, 2] = new_x2
+        self.boxes[:, 3] = new_y2
 
         new_ious = compute_iou_tensor(self.boxes, self.gt_boxes)
 
         new_gious = compute_giou_tensor(self.boxes, self.gt_boxes)
         new_dious = compute_diou_tensor(self.boxes, self.gt_boxes)
         
-        new_gious = compute_giou_tensor(self.boxes, self.gt_boxes)
         # 1. Shaping basato solo su GIoU (teoricamente fondato)
         giou_shaped = (GAMMA * new_gious) - self.previous_gious
         rewards = giou_shaped * 5.0
@@ -377,51 +406,73 @@ class BatchedActiveLocalizationEnv:
 
     def _simulate_move_boxes(self, boxes):
         num = boxes.shape[0]
-        w, h = boxes[:, 2], boxes[:, 3]
+        # w, h derivati dai box (x1, y1, x2, y2)
+        w, h = boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1]
         aw, ah = ALPHA * w, ALPHA * h
         zeros = torch.zeros(num, device=self.device)
 
+        
         deltas = {
-            0: (aw, zeros, zeros, zeros),
-            1: (-aw, zeros, zeros, zeros),
-            2: (zeros, -ah, zeros, zeros),
-            3: (zeros, ah, zeros, zeros),
-            4: (-aw, -ah, 2 * aw, 2 * ah),
-            5: (aw, ah, -2 * aw, -2 * ah),
-            6: (-aw, zeros, 2 * aw, zeros),
-            7: (zeros, -ah, zeros, 2 * ah),
+            0: (aw, zeros, aw, zeros),        # trasla destra: x1+=aw, x2+=aw
+            1: (-aw, zeros, -aw, zeros),      # trasla sinistra
+            2: (zeros, -ah, zeros, -ah),      # trasla su
+            3: (zeros, ah, zeros, ah),        # trasla giù
+            4: (aw, zeros, -aw, zeros),       # shrink orizzontale: x1+=aw, x2-=aw
+            5: (zeros, ah, zeros, -ah),       # shrink verticale
+            6: (-aw, zeros, aw, zeros),       # expand orizzontale: x1-=aw, x2+=aw
+            7: (zeros, -ah, zeros, ah),       # expand verticale
         }
 
         candidates = []
         for a in range(8):
-            dx, dy, dw, dh = deltas[a]
+            dx1, dy1, dx2, dy2 = deltas[a]
+            new_x1 = boxes[:, 0] + dx1
+            new_y1 = boxes[:, 1] + dy1
+            new_x2 = boxes[:, 2] + dx2
+            new_y2 = boxes[:, 3] + dy2
+
+            # clamp coordinate ai bordi immagine
+            new_x1 = torch.clamp(new_x1, 0, self.W)
+            new_y1 = torch.clamp(new_y1, 0, self.H)
+            new_x2 = torch.clamp(new_x2, 0, self.W)
+            new_y2 = torch.clamp(new_y2, 0, self.H)
+
+            # garantisci larghezza/altezza minima 10, senza spostare l'estremo opposto
+            new_x2 = torch.maximum(new_x2, new_x1 + 10)
+            new_y2 = torch.maximum(new_y2, new_y1 + 10)
+
             nb = boxes.clone()
-            nb[:, 0] = torch.clamp(boxes[:, 0] + dx, 0, self.W - 1)
-            nb[:, 1] = torch.clamp(boxes[:, 1] + dy, 0, self.H - 1)
-            nb[:, 2] = torch.clamp(boxes[:, 2] + dw, 10, self.W)
-            nb[:, 3] = torch.clamp(boxes[:, 3] + dh, 10, self.H)
+            nb[:, 0] = new_x1
+            nb[:, 1] = new_y1
+            nb[:, 2] = new_x2
+            nb[:, 3] = new_y2
             candidates.append(nb)
         return candidates
 
     def set_tau_iou(self, value):
         self.tau_iou = float(value)
 
+    def _param_distance(self, boxes):
+        dx = (boxes[:,0] - self.gt_boxes[:,0]) / self.W
+        dy = (boxes[:,1] - self.gt_boxes[:,1]) / self.H
+        dw = (boxes[:,2] - self.gt_boxes[:,2]) / self.W
+        dh = (boxes[:,3] - self.gt_boxes[:,3]) / self.H
+        return dx**2 + dy**2 + dw**2 + dh**2
+
     def compute_oracle_actions(self):
         candidates = self._simulate_move_boxes(self.boxes)
-        # Calcola sia IoU che GIoU per ogni candidato
-        dious = torch.stack([compute_diou_tensor(cb, self.gt_boxes) for cb in candidates], dim=1)  # [N, 8]
-        gious = torch.stack([compute_giou_tensor(cb, self.gt_boxes) for cb in candidates], dim=1)  # [N, 8]
-        
-        
-        score = 0.5 * gious + 0.5 * dious
-        
-        best_move_action = score.argmax(dim=1)
+        dious = torch.stack([compute_diou_tensor(cb, self.gt_boxes) for cb in candidates], dim=1)
+
+        # Nota: non mascheriamo più le mosse "clippate" dal bordo (quelle il cui
+        # effetto viene troncato dal clamp sui limiti dell'immagine). L'oracolo deve
+        # poter scegliere anche un'azione che si scontra col bordo, se è comunque
+        # quella che massimizza il DIoU risultante: in tal caso il box si sposterà
+        # fin dove il clamp lo consente, invece di essere escluso a priori.
+        best_move_action = dious.argmax(dim=1)
 
         current_iou = compute_iou_tensor(self.boxes, self.gt_boxes)
         should_trigger = current_iou >= self.tau_iou
-        return torch.where(
-            should_trigger, torch.full_like(best_move_action, 8), best_move_action
-        )
+        return torch.where(should_trigger, torch.full_like(best_move_action, 8), best_move_action)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. REPLAY BUFFER (solo EmbeddingReplayBuffer con PER)
@@ -1357,13 +1408,12 @@ def run_test(args, device, test_ds):
                 img = env.current_images[0].cpu().numpy().transpose(1, 2, 0)
                 img = (img * 255).astype(np.uint8)
 
-                gx, gy, gw, gh = env.gt_boxes[0].cpu().numpy()
-                frame = cv2.rectangle(img.copy(), (int(gx), int(gy)), (int(gx + gw), int(gy + gh)),
-                                       (0, 255, 255), 2)
+                gx, gy, gx2, gy2 = env.gt_boxes[0].cpu().numpy()
+                frame = cv2.rectangle(img.copy(), (int(gx), int(gy)), (int(gx2), int(gy2)), (0, 255, 255), 2)
 
-                x, y, w, h = env.boxes[0].cpu().numpy()
                 color = (0, 0, 255) if is_trigger else (0, 255, 0)
-                frame = cv2.rectangle(frame, (int(x), int(y)), (int(x + w), int(y + h)), color, 2)
+                x1, y1, x2, y2 = env.boxes[0].cpu().numpy()
+                frame = cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
 
                 # Step dell'ambiente (ora restituisce 6 valori)
                 next_obs, rewards, dones, ious, gious, dious = env.step(actions)
@@ -1414,14 +1464,16 @@ def run_test(args, device, test_ds):
 
         # Best frame (usa env.best_boxes e env.best_ious)
         best_iou_env = env.best_ious[0].item()
-        bx, by, bw, bh = env.best_boxes[0].cpu().numpy()
+        bx1, by1, bx2, by2 = env.best_boxes[0].cpu().numpy()   # ora (x1,y1,x2,y2)
         best_frame = env.current_images[0].cpu().numpy().transpose(1, 2, 0)
         best_frame = (best_frame * 255).astype(np.uint8)
-        gx, gy, gw, gh = env.gt_boxes[0].cpu().numpy()
-        best_frame = cv2.rectangle(best_frame.copy(), (int(gx), int(gy)), (int(gx + gw), int(gy + gh)),
+        gx1, gy1, gx2, gy2 = env.gt_boxes[0].cpu().numpy()     # ora (x1,y1,x2,y2)
+
+        # Disegna GT
+        best_frame = cv2.rectangle(best_frame.copy(), (int(gx1), int(gy1)), (int(gx2), int(gy2)),
                                     (0, 255, 255), 2)
-        best_frame = cv2.rectangle(best_frame, (int(bx), int(by)), (int(bx + bw), int(by + bh)),
-                                    (255, 0, 0), 3)
+        # Disegna best box
+        best_frame = cv2.rectangle(best_frame, (int(bx1), int(by1)), (int(bx2), int(by2)),(255, 0, 0), 3)
         cv2.putText(best_frame, f"BEST IoU: {best_iou_env:.3f}", (5, 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
         cv2.putText(best_frame, "Giallo=GT  Blu=miglior box trovato", (5, best_frame.shape[0] - 8),
