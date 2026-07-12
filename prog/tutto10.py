@@ -366,16 +366,18 @@ class BatchedActiveLocalizationEnv:
         delta_combined = diou_shaped * 0.5 + giou_shaped * 0.5
 
         rewards = delta_combined * 5.0
-        rewards = rewards - 0.02
 
-        # 2. Piccola penalità per stallo/loop combinata
-        iou_delta = new_ious - self.previous_ious
-        stall_penalty = torch.where(
-            (actions < 8) & (iou_delta < 0.005),
-            -0.02 * torch.clamp(self.repeat_counter, min=0.0),
-            torch.zeros_like(iou_delta)
-        )
-        rewards = rewards + stall_penalty
+        # Step penalty
+        rewards = rewards - 0.01
+
+        # # 2. Piccola penalità per stallo/loop combinata
+        # iou_delta = new_ious - self.previous_ious
+        # stall_penalty = torch.where(
+        #     (actions < 8) & (iou_delta < 0.005),
+        #     -0.02 * torch.clamp(self.repeat_counter, min=0.0),
+        #     torch.zeros_like(iou_delta)
+        # )
+        # rewards = rewards + stall_penalty
 
         # 3. Trigger reward semplice e forte
         terminated = (actions == 8)
@@ -616,22 +618,22 @@ class QNetwork(nn.Module):
             nn.Linear(input_dim, hidden),
             nn.LayerNorm(hidden),
             nn.ReLU(),
-            nn.Dropout(p=0.2),          # <-- aggiungi dropout
+            # nn.Dropout(p=0.2),          # <-- aggiungi dropout
             nn.Linear(hidden, hidden),
             nn.LayerNorm(hidden),
             nn.ReLU(),
-            nn.Dropout(p=0.1),          # <-- aggiungi dropout
+            # nn.Dropout(p=0.1),          # <-- aggiungi dropout
         )
         self.value_stream = nn.Sequential(
             nn.Linear(hidden, hidden // 2),
             nn.ReLU(),
-            nn.Dropout(p=0.1),          # <-- aggiungi dropout
+            # nn.Dropout(p=0.1),          # <-- aggiungi dropout
             nn.Linear(hidden // 2, 1)
         )
         self.advantage_stream = nn.Sequential(
             nn.Linear(hidden, hidden // 2),
             nn.ReLU(),
-            nn.Dropout(p=0.1),          # <-- aggiungi dropout
+            # nn.Dropout(p=0.1),          # <-- aggiungi dropout
             nn.Linear(hidden // 2, n_actions)
         )
 
