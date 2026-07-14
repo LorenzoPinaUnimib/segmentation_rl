@@ -28,7 +28,6 @@ from pathlib import Path
 import cv2
 import imageio
 import csv
-from itertools import cycle
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COSTANTI (solo quelle effettivamente usate)
@@ -43,7 +42,7 @@ TRIGGER_REWARD = 3.0
 REWARD_POSITIVE = 1.0
 REWARD_NEGATIVE = -1.0
 TAU_IOU = 0.6
-GAMMA = 0.90
+GAMMA = 0.9
 EPSILON_START = 1.0
 EPSILON_END = 0.1
 REWARD_CLIP = 10.0
@@ -361,8 +360,8 @@ class BatchedActiveLocalizationEnv:
         new_dious = compute_diou_tensor(self.boxes, self.gt_boxes)
         
         # 1. Shaping basato solo su GIoU (teoricamente fondato)
-        diou_shaped = (GAMMA * new_dious) - self.previous_dious
-        giou_shaped = (GAMMA * new_gious) - self.previous_gious
+        diou_shaped = new_dious - self.previous_dious
+        giou_shaped = new_gious - self.previous_gious
         delta_combined = diou_shaped * 0.5 + giou_shaped * 0.5
 
         rewards = delta_combined * 5.0
@@ -490,7 +489,7 @@ class BatchedActiveLocalizationEnv:
         best_move_action = dious.argmax(dim=1)
 
         current_iou = compute_iou_tensor(self.boxes, self.gt_boxes)
-        should_trigger = current_iou >= self.tau_iou
+        should_trigger = current_iou >= 0.8
         return torch.where(should_trigger, torch.full_like(best_move_action, 8), best_move_action)
 
 # ─────────────────────────────────────────────────────────────────────────────

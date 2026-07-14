@@ -396,8 +396,10 @@ def _build_datasets_from_pairs(pairs, inspector, cfg, seed):
 
 
 def load_local_dataset(cfg: dict) -> Tuple[Dataset, Dataset, Dataset]:
-    """Load dataset from local filesystem (auto-detects COCO JSON or file pairs)."""
+    # Ottengo il percorso del dataset
     root = cfg["dataset"]["local_path"]
+
+    # Controllo che il percorso esista
     assert root and os.path.exists(root), f"local_path not found: {root}"
 
     inspector = DatasetInspector(root)
@@ -414,16 +416,21 @@ def load_local_dataset(cfg: dict) -> Tuple[Dataset, Dataset, Dataset]:
     seed = cfg.get("seed", 42)
     return _build_datasets_from_pairs(pairs, inspector, cfg, seed)
 
-
 def load_kaggle_dataset(cfg: dict) -> Tuple[Dataset, Dataset, Dataset]:
-    """Download dataset via kagglehub and load."""
+    # Ottengo informazioni del dataset da scaricare
     kaggle_id = cfg["dataset"]["kaggle_id"]
     print(f"[data] Downloading Kaggle dataset: {kaggle_id}")
+
     try:
+        # Scarico il dataset
         import kagglehub
         path = kagglehub.dataset_download(kaggle_id)
+
         print(f"[data] Downloaded to: {path}")
+
+        # Imposto il percorso
         cfg["dataset"]["local_path"] = path
+
         return load_local_dataset(cfg)
     except Exception as e:
         print(f"[data] Kaggle download failed ({e}). Falling back to synthetic.")
@@ -440,7 +447,6 @@ def _make_synthetic(cfg: dict) -> Tuple[Dataset, Dataset, Dataset]:
 
 
 def get_datasets(cfg: dict) -> Tuple[Dataset, Dataset, Dataset]:
-    """Top-level dispatcher."""
     source = cfg["dataset"]["source"]
     if source == "kaggle":
         return load_kaggle_dataset(cfg)

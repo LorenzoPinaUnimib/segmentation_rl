@@ -81,9 +81,9 @@ SPATIAL_BIAS_DIM = 6  # bias_lr, bias_tb, centroid_x, centroid_y, spread_x, spre
 COORD_FEAT_DIM = BOX_FEAT_DIM + SPATIAL_BIAS_DIM
 
 # ── Fix coarse-to-fine (vedi discussione: shrink trap, floor traslazione, oracolo miope) ──
-PHASE_MIN_STEPS = 5        # step minimi nell'episodio prima di sbloccare shrink (azioni 4,5)
+PHASE_MIN_STEPS = 0        # step minimi nell'episodio prima di sbloccare shrink (azioni 4,5)
 PHASE_IOU_THRESHOLD = 0.3  # oppure: sblocca subito shrink se l'IoU corrente è già decente
-MIN_TRANSLATE_PIXELS = 8.0 # floor assoluto (in pixel) sul passo di traslazione, indipendente dal size del box
+MIN_TRANSLATE_PIXELS = 1.0 # floor assoluto (in pixel) sul passo di traslazione, indipendente dal size del box
 ORACLE_LOOKAHEAD_STEPS = 2 # profondità di lookahead dell'oracolo (era 1 = greedy miope)
 
 # PER (Prioritized Experience Replay)
@@ -623,7 +623,7 @@ class BatchedActiveLocalizationEnv:
         best_move_action = values.argmax(dim=1)
 
         current_iou = compute_iou_tensor(self.boxes, self.gt_boxes)
-        should_trigger = current_iou >= self.tau_iou
+        should_trigger = current_iou >= 0.7
         return torch.where(should_trigger, torch.full_like(best_move_action, 8), best_move_action)
 
 # ─────────────────────────────────────────────────────────────────────────────
