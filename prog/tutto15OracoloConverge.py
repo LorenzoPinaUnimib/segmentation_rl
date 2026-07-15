@@ -1,59 +1,25 @@
-"""
-Versione ridotta di tutto6.py, ottimizzata per:
-- Training con --pretrained-backbone ./pretrained/backbone_pretrained_backbone.pt
-- Test con --test --model <checkpoint> --device cpu
-
-Rimosse tutte le funzionalità non utilizzate (NoisyNet, data augmentation, curriculum adattivo,
-buffer immagini, validazione infra-epoca, ecc.).
-Le metriche si basano esclusivamente sull'ultima iterazione di ogni episodio (trigger o timeout).
-Durante il training, nel progress bar e nei log viene mostrato l'IoU dello step corrente.
-
-BACKBONE SEMPRE CONGELATO (item richiesto: "architettura ottimale per fare RL e poterla
-bloccare"): a differenza di versioni precedenti (tutto.py) che esponevano un flag
---backbone-freeze per scegliere se sbloccare il backbone durante l'RL, questa versione
-ridotta usa SOLO EmbeddingReplayBuffer (niente ImageReplayBuffer) e quindi il backbone
-ResNet18 (+ spatial_pool) è SEMPRE congelato — vedi PolicyNetwork.__init__, dove
-requires_grad_(False) viene applicato incondizionatamente. L'unico modulo allenato durante
-l'RL è QNetwork (policy_net.head), come si vede nell'optimizer in train() che riceve solo
-policy_net.head.parameters(). Il flag --backbone-freeze esiste comunque in CLI (vedi sotto)
-solo per compatibilità con i comandi storici/documentazione: accetta solo "all" e serve da
-promemoria/validazione esplicita, non cambia il comportamento (già sempre "all").
-
-CARICAMENTO PESI DA PRETRAIN: --pretrained-backbone accetta il file *_backbone.pt prodotto
-da pretrain_backbone.py. Quel file contiene "backbone_state_dict" e, se disponibile,
-"spatial_pool_state_dict". L'architettura di SpatialAttentionPool/EMBED_DIM/WARP_SIZE usata
-qui è la STESSA importata (con `from tutto13 import ...`) da pretrain_backbone.py, quindi il
-caricamento dei pesi è garantito bit-a-bit compatibile: non serve nessuna conversione o
-rimappatura manuale delle chiavi. Se il checkpoint contiene anche spatial_pool_state_dict,
-verrà usata SpatialAttentionPool pretrainata (congelata); altrimenti si ripiega su un semplice
-AdaptiveAvgPool2d(1), per evitare di usare un modulo con parametri casuali che l'RL non potrebbe
-mai allenare (il backbone è sempre congelato).
-"""
-import gc
-import os
-import copy
-import math
-import collections
 import argparse
-import random
+import collections
+import copy
+import csv
+import cv2
 import datetime
+import gc
+import imageio
+import math
 import numpy as np
+import os
+from pathlib import Path
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.ops import roi_align
-from pathlib import Path
-import cv2
-import imageio
-import csv
-from itertools import cycle
 
-# ─────────────────────────────────────────────────────────────────────────────
-# COSTANTI (solo quelle effettivamente usate)
-# ─────────────────────────────────────────────────────────────────────────────
 N_ACTIONS = 9
 ALPHA = 0.1
 WARP_SIZE = (224, 224)
@@ -80,12 +46,14 @@ BOX_FEAT_DIM = 5
 SPATIAL_BIAS_DIM = 6  # bias_lr, bias_tb, centroid_x, centroid_y, spread_x, spread_y
 COORD_FEAT_DIM = BOX_FEAT_DIM + SPATIAL_BIAS_DIM
 
-# ── Fix coarse-to-fine (vedi discussione: shrink trap, floor traslazione, oracolo miope) ──
-PHASE_MIN_STEPS = 0        # step minimi nell'episodio prima di sbloccare shrink (azioni 4,5)
-PHASE_IOU_THRESHOLD = 0.3  # oppure: sblocca subito shrink se l'IoU corrente è già decente
-MIN_TRANSLATE_PIXELS = 1.0 # floor assoluto (in pixel) sul passo di traslazione, indipendente dal size del box
-MIN_SCALE_PIXELS = 1.0     # floor assoluto (in pixel) sul passo di shrink/expand, indipendente dal size del box
-ORACLE_LOOKAHEAD_STEPS = 2 # profondità di lookahead dell'oracolo (era 1 = greedy miope)
+# Dimensione minima degli spostamenti in pixel
+MIN_TRANSLATE_PIXELS = 1.0
+
+# Dimensione minima dei ridimensionamenti in pixel
+MIN_SCALE_PIXELS = 1.0
+
+# Profondità di lookahead dell'oracolo
+ORACLE_LOOKAHEAD_STEPS = 2
 
 # PER (Prioritized Experience Replay)
 PER_ALPHA = 0.6
@@ -99,21 +67,8 @@ N_STEP = 3
 # Reward scaling
 REWARD_SCALING_EPS = 1e-6
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. UTILITY FUNCTIONS (GPU)
-# ─────────────────────────────────────────────────────────────────────────────
-def compute_iou_tensor(b1, b2):
-    # b1, b2: [N, 4] (x1, y1, x2, y2)
-    xi1 = torch.max(b1[:, 0], b2[:, 0])
-    yi1 = torch.max(b1[:, 1], b2[:, 1])
-    xi2 = torch.min(b1[:, 2], b2[:, 2])
-    yi2 = torch.min(b1[:, 3], b2[:, 3])
-    inter_area = torch.clamp(xi2 - xi1, min=0) * torch.clamp(yi2 - yi1, min=0)
-    area1 = torch.clamp(b1[:, 2] - b1[:, 0], min=0) * torch.clamp(b1[:, 3] - b1[:, 1], min=0)
-    area2 = torch.clamp(b2[:, 2] - b2[:, 0], min=0) * torch.clamp(b2[:, 3] - b2[:, 1], min=0)
-    union_area = area1 + area2 - inter_area
-    return inter_area / torch.clamp(union_area, min=1e-6)
 
+# POSSIBILMENTE DA RIMUOVERE
 def compute_giou_tensor(b1, b2):
     # b1, b2: [N, 4] (x1, y1, x2, y2)
     xi1 = torch.max(b1[:, 0], b2[:, 0])
@@ -166,62 +121,67 @@ def compute_diou_tensor(b1, b2):
     return diou
 
 
+
+
+
+def compute_iou_tensor(b1, b2):
+    # Calcolo il massimo delle coordinate x e y iniziali tra le due box (se c'è sovrapposiziona inizierà da dove entrambe le box esistono)
+    xi1 = torch.max(b1[:, 0], b2[:, 0])
+    yi1 = torch.max(b1[:, 1], b2[:, 1])
+
+    # Calcolo il minimo delle coordinate x e y finali tra le due box (se c'è sovrapposizione finirà dove una delle box smettone di esistere)
+    xi2 = torch.min(b1[:, 2], b2[:, 2])
+    yi2 = torch.min(b1[:, 3], b2[:, 3])
+
+    # Calcolo intersezione, unione e divido
+    inter_area = torch.clamp(xi2 - xi1, min=0) * torch.clamp(yi2 - yi1, min=0)
+    area1 = torch.clamp(b1[:, 2] - b1[:, 0], min=0) * torch.clamp(b1[:, 3] - b1[:, 1], min=0)
+    area2 = torch.clamp(b2[:, 2] - b2[:, 0], min=0) * torch.clamp(b2[:, 3] - b2[:, 1], min=0)
+    union_area = area1 + area2 - inter_area
+
+    return inter_area / torch.clamp(union_area, min=1e-6)
+
 def compute_ciou_tensor(b1, b2):
-    # b1, b2: [N, 4] (x1, y1, x2, y2)
-    # Center points
+    # Calcolo il centro delle due box
     c1_x = (b1[:, 0] + b1[:, 2]) / 2
     c1_y = (b1[:, 1] + b1[:, 3]) / 2
     c2_x = (b2[:, 0] + b2[:, 2]) / 2
     c2_y = (b2[:, 1] + b2[:, 3]) / 2
 
-    # Euclidean distance squared between centers
+    # Calcolo la distanza tra i due centri al quadrato
     rho2 = (c1_x - c2_x)**2 + (c1_y - c2_y)**2
 
-    # Diagonal length squared of the smallest enclosing box
+    # Calcolo il minimo delle coordinate x e y iniziali tra le due box
     x1_min = torch.min(b1[:, 0], b2[:, 0])
     y1_min = torch.min(b1[:, 1], b2[:, 1])
+
+    # Calcolo il massimo delle coordinate x e y finali tra le due box
     x2_max = torch.max(b1[:, 2], b2[:, 2])
     y2_max = torch.max(b1[:, 3], b2[:, 3])
+
+    # Calcolo la diagonale al quadrato di questa box
     c2 = (x2_max - x1_min)**2 + (y2_max - y1_min)**2
 
-    # IoU
-    xi1 = torch.max(b1[:, 0], b2[:, 0])
-    yi1 = torch.max(b1[:, 1], b2[:, 1])
-    xi2 = torch.min(b1[:, 2], b2[:, 2])
-    yi2 = torch.min(b1[:, 3], b2[:, 3])
-    inter = torch.clamp(xi2 - xi1, min=0) * torch.clamp(yi2 - yi1, min=0)
+    # Calcolo IoU
+    iou = compute_iou_tensor(b1, b2)
+
     w1 = torch.clamp(b1[:, 2] - b1[:, 0], min=0)
     h1 = torch.clamp(b1[:, 3] - b1[:, 1], min=0)
     w2 = torch.clamp(b2[:, 2] - b2[:, 0], min=0)
     h2 = torch.clamp(b2[:, 3] - b2[:, 1], min=0)
-    area1 = w1 * h1
-    area2 = w2 * h2
-    union = area1 + area2 - inter
-    iou = inter / torch.clamp(union, min=1e-6)
 
-    # Aspect ratio consistency term
+    # Calcolo differenze di rapporto
     v = (4 / (math.pi ** 2)) * torch.pow(
         torch.atan(w2 / torch.clamp(h2, min=1e-6)) - torch.atan(w1 / torch.clamp(h1, min=1e-6)), 2
     )
+
+    # Calcolo peso del rapporto nel calcolo
     with torch.no_grad():
         alpha = v / torch.clamp(1 - iou + v, min=1e-6)
 
+    # Calcolo CIoU
     ciou = iou - (rho2 / torch.clamp(c2, min=1e-6)) - alpha * v
     return ciou
-
-
-def _clamp_box(self, x1, y1, x2, y2):
-    x1 = torch.clamp(x1, 0, self.W)
-    y1 = torch.clamp(y1, 0, self.H)
-    x2 = torch.clamp(x2, 0, self.W)
-    y2 = torch.clamp(y2, 0, self.H)
-    x2 = torch.maximum(x2, x1 + 10)
-    y2 = torch.maximum(y2, y1 + 10)
-    x2 = torch.clamp(x2, max=self.W)
-    y2 = torch.clamp(y2, max=self.H)
-    x1 = torch.minimum(x1, x2 - 10)
-    y1 = torch.minimum(y1, y2 - 10)
-    return x1, y1, x2, y2
 
 class RunningMeanStd:
     """Stima online media/varianza per reward scaling."""
@@ -383,22 +343,12 @@ class BatchedActiveLocalizationEnv:
         y1 = torch.minimum(y1, y2 - 5)
         return x1, y1, x2, y2
 
-    def get_shrink_allowed_mask(self):
-        """True per gli env in cui le azioni di shrink (4,5) sono sbloccate:
-        dopo un numero minimo di step nell'episodio, oppure se l'allineamento
-        (IoU corrente rispetto al GT) è già decente. Finché non è vero, l'agente
-        può solo tradurre/espandere: evita che il box si rimpicciolisca prima di
-        essere centrato, il che renderebbe i passi di correzione successivi troppo
-        piccoli per recuperare (vedi 'shrink trap')."""
-        return (self.current_steps >= PHASE_MIN_STEPS) 
-
     def step(self, actions):
         # Maschera di fase calcolata PRIMA dell'incremento di current_steps, così
         # riflette esattamente ciò che l'agente/oracolo hanno visto quando hanno
         # scelto l'azione. Serve anche come rete di sicurezza: se per qualsiasi
         # motivo arriva un'azione di shrink (4,5) non ammessa in questa fase
         # dell'episodio, la neutralizziamo (no-op) invece di eseguirla.
-        shrink_allowed = self.get_shrink_allowed_mask()
         self.current_steps += 1
 
         same_action = (actions == self.last_action) & (actions < 8)
@@ -431,12 +381,7 @@ class BatchedActiveLocalizationEnv:
         dx2 = torch.zeros(self.num_envs, device=self.device)
         dy2 = torch.zeros(self.num_envs, device=self.device)
 
-        m0 = (actions == 0); m1 = (actions == 1); m2 = (actions == 2); m3 = (actions == 3)
-        # Le azioni di shrink sono valide solo dove shrink_allowed è True: altrove
-        # vengono trattate come no-op (dx/dy restano a 0 per quell'env).
-        m4 = (actions == 4) & shrink_allowed
-        m5 = (actions == 5) & shrink_allowed
-        m6 = (actions == 6); m7 = (actions == 7)
+        m0 = (actions == 0); m1 = (actions == 1); m2 = (actions == 2); m3 = (actions == 3); m4 = (actions == 4); m5 = (actions == 5); m6 = (actions == 6); m7 = (actions == 7)
 
         # traslazione destra/sinistra: entrambi gli estremi x si spostano insieme
         dx1[m0] = aw_move[m0]; dx2[m0] = aw_move[m0]
@@ -617,8 +562,7 @@ class BatchedActiveLocalizationEnv:
         
         return compute_iou_tensor(boxes, gt_repeated)
 
-    def compute_oracle_actions(self, lookahead=ORACLE_LOOKAHEAD_STEPS):
-        shrink_allowed = self.get_shrink_allowed_mask()  
+    def compute_oracle_actions(self, lookahead=ORACLE_LOOKAHEAD_STEPS): 
         N = self.boxes.shape[0]
         lookahead = max(int(lookahead), 0)
 
@@ -657,10 +601,6 @@ class BatchedActiveLocalizationEnv:
                 child_values = expand_level(child_boxes, child_env, child_depth)
                 child_values = child_values.reshape(M, 8).clone()
 
-                sa = shrink_allowed[oe]
-                child_values[~sa, 4] = -1e9
-                child_values[~sa, 5] = -1e9
-
                 value[open_idx] = child_values.max(dim=1)[0]
 
             return value
@@ -671,9 +611,6 @@ class BatchedActiveLocalizationEnv:
         depth0 = torch.ones(N * 8, dtype=torch.long, device=self.device)
 
         values0 = expand_level(boxes0, env0, depth0).reshape(N, 8)
-        values0 = values0.clone()
-        values0[~shrink_allowed, 4] = -1e9
-        values0[~shrink_allowed, 5] = -1e9
         best_move_action = values0.argmax(dim=1)
 
         # Anche qui usiamo compute_iou_tensor direttamente
@@ -1067,11 +1004,7 @@ def validate(env, policy_net, val_indices, device, writer, global_step, epoch, n
             if not active_mask.any():
                 break
             q_values = policy_net(obs["rois"], obs["histories"], obs["extra"], global_features=global_features)
-            shrink_allowed = env.get_shrink_allowed_mask()
-            q_values_masked = q_values.clone()
-            q_values_masked[~shrink_allowed, 4] = -1e9
-            q_values_masked[~shrink_allowed, 5] = -1e9
-            actions = q_values_masked.argmax(dim=1)
+            actions = q_values.argmax(dim=1)
             step_counts[active_mask] += 1
             next_obs, rewards, dones, ious, gious, dious = env.step(actions)
             
@@ -1128,9 +1061,9 @@ def validate(env, policy_net, val_indices, device, writer, global_step, epoch, n
     writer.add_scalar(f"{tag}/Reward_std", std_reward, global_step)
     writer.add_scalar(f"{tag}/Reward_max", max_reward, global_step)
     
-    writer.add_scalar(f"{tag}/Step_max", mean_step, global_step)
+    writer.add_scalar(f"{tag}/Step_max", max_step, global_step)
     writer.add_scalar(f"{tag}/Step_std", std_step, global_step)
-    writer.add_scalar(f"{tag}/Step_avg", max_step, global_step)
+    writer.add_scalar(f"{tag}/Step_avg", mean_step, global_step)
 
     policy_net.train()
       # Ritorna tutte le metriche in un dizionario
@@ -1414,11 +1347,7 @@ def train(args, device, train_ds, val_ds):
                 q_values = policy_net(obs["rois"], obs["histories"], obs["extra"], global_features=global_features)
                 # Maschera di fase: finché lo shrink non è sbloccato per un env,
                 # le colonne 4/5 vengono escluse dall'argmax (vedi "shrink trap").
-                shrink_allowed = train_env.get_shrink_allowed_mask()
-                q_values_masked = q_values.clone()
-                q_values_masked[~shrink_allowed, 4] = -1e9
-                q_values_masked[~shrink_allowed, 5] = -1e9
-                agent_actions = q_values_masked.argmax(dim=1)
+                agent_actions = q_values.argmax(dim=1)
 
                 teacher_mask = torch.rand(args.batch_size, device=device) < p_teacher
                 actions = agent_actions.clone()
@@ -1430,15 +1359,6 @@ def train(args, device, train_ds, val_ds):
                 if explore_mask.any():
                     n_explore = int(explore_mask.sum().item())
                     rand_actions = torch.randint(0, N_ACTIONS, (n_explore,), device=device)
-                    # Rimappa gli esplorativi che pescano shrink (4,5) non ammesso
-                    # su una traslazione casuale (0-3), invece di sprecare lo step
-                    # in un no-op silenzioso dentro step().
-                    explore_idx = torch.where(explore_mask)[0]
-                    disallowed = (~shrink_allowed[explore_idx]) & ((rand_actions == 4) | (rand_actions == 5))
-                    if disallowed.any():
-                        rand_actions[disallowed] = torch.randint(
-                            0, 4, (int(disallowed.sum().item()),), device=device
-                        )
                     actions[explore_mask] = rand_actions
 
                 is_expert_step = teacher_mask.float()
