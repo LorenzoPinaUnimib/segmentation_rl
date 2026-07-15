@@ -517,144 +517,157 @@ class BatchedActiveLocalizationEnv:
         return self._get_obs(), rewards, (terminated | truncated), new_ious, new_gious, new_dious
 
     def _simulate_move_boxes(self, boxes):
+        # Ottengo il numero delle box
         num = boxes.shape[0]
-        # w, h derivati dai box (x1, y1, x2, y2)
+
+        # Determino la dimensione di ciascuna box
         w, h = boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1]
-        # Stessa distinzione usata in step(): shrink/expand restano proporzionali,
-        # la traslazione ha un floor assoluto in pixel. Deve rispecchiare esattamente
-        # la dinamica reale, altrimenti l'oracolo pianifica su un modello sbagliato.
-        #aw_size, ah_size = ALPHA * w, ALPHA * h
         
+        # Calcolo la dimensione dei redimensionamenti
         aw_size = torch.clamp(ALPHA * w, min=MIN_SCALE_PIXELS)
         ah_size = torch.clamp(ALPHA * h, min=MIN_SCALE_PIXELS)
+
+        # Calcolo la dimensione degli spostamenti
         aw_move = torch.clamp(ALPHA * w, min=MIN_TRANSLATE_PIXELS)
         ah_move = torch.clamp(ALPHA * h, min=MIN_TRANSLATE_PIXELS)
+
+        # Definisco un vettore di zeri da usare nei delta
         zeros = torch.zeros(num, device=self.device)
 
-        
         deltas = {
-            0: (aw_move, zeros, aw_move, zeros),        # trasla destra: x1+=aw, x2+=aw
-            1: (-aw_move, zeros, -aw_move, zeros),      # trasla sinistra
-            2: (zeros, -ah_move, zeros, -ah_move),      # trasla su
-            3: (zeros, ah_move, zeros, ah_move),        # trasla giù
-            4: (aw_size, zeros, -aw_size, zeros),       # shrink orizzontale: x1+=aw, x2-=aw
-            5: (zeros, ah_size, zeros, -ah_size),       # shrink verticale
-            6: (-aw_size, zeros, aw_size, zeros),       # expand orizzontale: x1-=aw, x2+=aw
-            7: (zeros, -ah_size, zeros, ah_size),       # expand verticale
+            # Sposta a destra
+            0: (aw_move, zeros, aw_move, zeros),
+            # Sposta a sinistra
+            1: (-aw_move, zeros, -aw_move, zeros),
+            # Sposta in alto
+            2: (zeros, -ah_move, zeros, -ah_move),
+            # Sposta in basso
+            3: (zeros, ah_move, zeros, ah_move),
+            # Riduzione orizzontale
+            4: (aw_size, zeros, -aw_size, zeros),
+            # Riduzione verticale
+            5: (zeros, ah_size, zeros, -ah_size),
+            # Aumento orizzontale
+            6: (-aw_size, zeros, aw_size, zeros),
+            # Aumento verticale
+            7: (zeros, -ah_size, zeros, ah_size),
         }
 
+        # Lista delle varie box
         candidates = []
+
         for a in range(8):
+            # Calcolo le nuove coordinate per le varie azioni
             dx1, dy1, dx2, dy2 = deltas[a]
+
             new_x1 = boxes[:, 0] + dx1
             new_y1 = boxes[:, 1] + dy1
             new_x2 = boxes[:, 2] + dx2
             new_y2 = boxes[:, 3] + dy2
 
+            # Evito che le coordinate siano fuori dall'immagine
             new_x1, new_y1, new_x2, new_y2 = self._clamp_box(new_x1, new_y1, new_x2, new_y2)
 
+            # Salvo le coordinate in un nuovo tensore
             nb = boxes.clone()
+
             nb[:, 0] = new_x1
             nb[:, 1] = new_y1
             nb[:, 2] = new_x2
             nb[:, 3] = new_y2
+
             candidates.append(nb)
+
         return candidates
 
     def set_tau_iou(self, value):
+        # Imposto la nuova tau IoU
         self.tau_iou = float(value)
 
-    def _param_distance(self, boxes):
-        dx = (boxes[:,0] - self.gt_boxes[:,0]) / self.W
-        dy = (boxes[:,1] - self.gt_boxes[:,1]) / self.H
-        dw = (boxes[:,2] - self.gt_boxes[:,2]) / self.W
-        dh = (boxes[:,3] - self.gt_boxes[:,3]) / self.H
-        return dx**2 + dy**2 + dw**2 + dh**2
-    
-    def masked_ciou(self, boxes):
-        # boxes: [N * 8, 4]
-        # self.gt_boxes: [N, 4]
-        
-        # Calculate how many candidates exist per environment
-        N = self.gt_boxes.shape[0]
-        num_candidates = boxes.shape[0]
-        repeat_factor = num_candidates // N
-        
-        # Expand self.gt_boxes to [N * 8, 4] to match boxes
-        gt_repeated = self.gt_boxes.repeat(repeat_factor, 1)
-
-        return compute_ciou_tensor(boxes, gt_repeated)
-
-    def masked_iou(self, boxes):
-        # boxes shape: [N * 8, 4]
-        # self.gt_boxes shape: [N, 4]
-        
-        # Calculate how many candidates exist per environment (usually 8)
-        N = self.gt_boxes.shape[0]
-        num_candidates = boxes.shape[0]
-        repeat_factor = num_candidates // N
-        
-        # Repeat the ground truth boxes to match the number of candidates
-        # repeat_interleave ensures that every candidate for environment 'i' 
-        # is matched with the ground truth for environment 'i'
-        gt_repeated = self.gt_boxes.repeat_interleave(repeat_factor, dim=0)
-        
-        return compute_iou_tensor(boxes, gt_repeated)
-
-    def compute_oracle_actions(self, lookahead=ORACLE_LOOKAHEAD_STEPS): 
-        N = self.boxes.shape[0]
-        lookahead = max(int(lookahead), 0)
-
-        steps_left = torch.clamp(MAX_STEPS_PER_EPISODE - self.current_steps, min=0)
-        usable_depth = torch.clamp(steps_left, max=lookahead)
-
+    def compute_oracle_actions(self, lookahead=ORACLE_LOOKAHEAD_STEPS):
         def expand_level(boxes, env_idx, depth):
-            # Estraiamo la GT corretta per ogni nodo usando env_idx! 
-            # Addio bug di repeat/interleave.
+            # Estraggo la GT corretta
             current_gts = self.gt_boxes[env_idx]
+
+            # Calcolo variabili
             ciou = compute_ciou_tensor(boxes, current_gts)
             iou = compute_iou_tensor(boxes, current_gts)
 
-            # Usiamo il tau_iou dinamico dell'ambiente, non 0.8 hardcoded
+            # Determino se IoU è sopra il valore desiderato
             can_trigger = iou >= 0.8
+
+            # Determino se ci sono appastanza passi
             beyond_budget = depth >= usable_depth[env_idx]
+
+            # Determino se sono più profondo del lookahead
             at_horizon = depth >= lookahead
+
+            # Determino se devo fermare l'espansione
             closed = can_trigger | beyond_budget | at_horizon
 
+            # Imposto il valore attuale del nodo
             value = ciou.clone()
 
+            # Determino gli indici degli elementi da espandere
             open_idx = (~closed).nonzero(as_tuple=True)[0]
+
             if open_idx.numel() > 0:
+                # Recupero le informazioni dell'elemento attuale
                 ob = boxes[open_idx]
                 oe = env_idx[open_idx]
                 od = depth[open_idx]
 
+                # Calcolo le candidate
                 cand = self._simulate_move_boxes(ob)
                 cand = torch.stack(cand, dim=1)
                 M = ob.shape[0]
 
+                # Copio l'ambiente, profondità e box per i figli
                 child_env = oe.unsqueeze(1).expand(M, 8).reshape(-1)
                 child_depth = (od.unsqueeze(1) + 1).expand(M, 8).reshape(-1)
                 child_boxes = cand.reshape(-1, 4)
 
+                # Calcolo il valore dei figli
                 child_values = expand_level(child_boxes, child_env, child_depth)
                 child_values = child_values.reshape(M, 8).clone()
 
+                # Imposto il valore massimo al massimo dei figli
                 value[open_idx] = child_values.max(dim=1)[0]
 
             return value
+        
+        # Ottengo il numero di box
+        N = self.boxes.shape[0]
+        
+        # Calcolo la IoU attuale e determino se devo concludere
+        current_iou = compute_iou_tensor(self.boxes, self.gt_boxes)
+        should_trigger = current_iou >= 0.8
 
+        # Se tutti devono triggerare ritorno l'azione 8
+        if bool(should_trigger.all()):
+            return torch.full(
+                (N,), 8, device=self.device, dtype=torch.long
+            )
+
+        # Impedisco che il lookahead sia negativo
+        lookahead = max(int(lookahead), 0)
+
+        # Determino quale è il numero di step massimi di lookahead per ambiente
+        steps_left = torch.clamp(MAX_STEPS_PER_EPISODE - self.current_steps, min=0)
+        usable_depth = torch.clamp(steps_left, max=lookahead)
+
+        # Genero le box candidate, gli ambienti e imposto le profondità
         root_candidates = self._simulate_move_boxes(self.boxes)
         boxes0 = torch.stack(root_candidates, dim=1).reshape(-1, 4)
         env0 = torch.arange(N, device=self.device).unsqueeze(1).expand(N, 8).reshape(-1)
         depth0 = torch.ones(N * 8, dtype=torch.long, device=self.device)
 
+        # Calcolo i valori per ciascuna mossa
         values0 = expand_level(boxes0, env0, depth0).reshape(N, 8)
+
+        # Calcolo la mossa migliore
         best_move_action = values0.argmax(dim=1)
 
-        # Anche qui usiamo compute_iou_tensor direttamente
-        current_iou = compute_iou_tensor(self.boxes, self.gt_boxes)
-        should_trigger = current_iou >= 0.8
         return torch.where(should_trigger, torch.full_like(best_move_action, 8), best_move_action)
 
 # ─────────────────────────────────────────────────────────────────────────────
