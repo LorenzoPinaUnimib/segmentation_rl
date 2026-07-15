@@ -20,11 +20,17 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.ops import roi_align
 
+# Numero di azioni
 N_ACTIONS = 9
+
+# Tasso di spostamento della box
 ALPHA = 0.1
+
 WARP_SIZE = (224, 224)
 HISTORY_LENGTH = 10
 CONTEXT_PIXELS = 16
+
+# Numero massimo di step in un episodio
 MAX_STEPS_PER_EPISODE = 50
 TRIGGER_REWARD = 3.0
 REWARD_POSITIVE = 1.0
@@ -184,112 +190,155 @@ def compute_ciou_tensor(b1, b2):
     return ciou
 
 class RunningMeanStd:
-    """Stima online media/varianza per reward scaling."""
     def __init__(self, eps=1e-4, device="cpu"):
+        # Definisco le variabili
         self.mean = torch.zeros(1, device=device)
         self.var = torch.ones(1, device=device)
         self.count = eps
 
     def update(self, x: torch.Tensor):
+        # Appiattisco i dati
         x = x.detach().reshape(-1)
+
+        # Controllo se è vuoto
         if x.numel() == 0:
             return
+        
+        # Ottendo i dati aggiornati
         batch_mean = x.mean()
         batch_var = x.var(unbiased=False)
         batch_count = x.numel()
+
+        # Calcolo la differenza di media
         delta = batch_mean - self.mean.to(batch_mean.device)
+
+        # Aggiorno il conteggio e la media
         tot_count = self.count + batch_count
         new_mean = self.mean.to(batch_mean.device) + delta * batch_count / tot_count
+        
+        # Calcolo nuova varianza
         m_a = self.var.to(batch_mean.device) * self.count
         m_b = batch_var * batch_count
         m2 = m_a + m_b + (delta ** 2) * self.count * batch_count / tot_count
         new_var = m2 / tot_count
+
+        # Aggiorno i valori
         self.mean = new_mean
         self.var = new_var
         self.count = tot_count
 
     def std(self):
+        # Calcolo della deviazione standard
         return torch.sqrt(self.var + REWARD_SCALING_EPS)
 
     def scale_only(self, x: torch.Tensor):
+        # Normalizzazione
         return x / self.std().to(x.device)
 
     def state_dict(self):
+        # Ritorno i dati
         return {"mean": self.mean.clone(), "var": self.var.clone(), "count": self.count}
 
     def load_state_dict(self, sd):
+        # Carico dati
         self.mean = sd["mean"].clone()
         self.var = sd["var"].clone()
         self.count = sd["count"]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. AMBIENTE VETTORIZZATO
-# ─────────────────────────────────────────────────────────────────────────────
 class BatchedActiveLocalizationEnv:
     def __init__(self, pytorch_dataset, batch_size, device):
+        # Inizializzo gli elementi che verranno utilizzati
         self.dataset = pytorch_dataset
         self.num_envs = batch_size
         self.tau_iou = TAU_IOU
         self.device = device
 
+        # Leggo le dimensioni di un'immagine
         sample = self.dataset[0]
         self.C, self.H, self.W = sample["image"].shape
 
+        # Contiene tutte le immagini, box attuali e ground truth
         self.current_images = torch.zeros((batch_size, self.C, self.H, self.W),
                                           dtype=torch.float32, device=device)
         self.gt_boxes = torch.zeros((batch_size, 4), dtype=torch.float32, device=device)
         self.boxes = torch.zeros((batch_size, 4), dtype=torch.float32, device=device)
+        
+        # Contiene la memoria dei passi precedenti
         self.histories = torch.zeros((batch_size, HISTORY_LENGTH * N_ACTIONS),
                                      dtype=torch.float32, device=device)
+        
+        # Contiene il numero di step attuali
         self.current_steps = torch.zeros(batch_size, dtype=torch.long, device=device)
+        
+        # Contiene le variabili precedenti
         self.previous_ious = torch.zeros(batch_size, dtype=torch.float32, device=device)
         self.previous_gious = torch.zeros(batch_size, dtype=torch.float32, device=device)
         self.previous_dious = torch.zeros(batch_size, dtype=torch.float32, device=device)
         self.previous_cious = torch.zeros(batch_size, dtype=torch.float32, device=device)
         self.previous_dists = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        
+        # Contiene la migliore IoU e box
         self.best_ious = torch.zeros(batch_size, dtype=torch.float32, device=device)
         self.best_boxes = torch.zeros((batch_size, 4), dtype=torch.float32, device=device)
+        
+        # Contiene l'ultima azione
         self.one_hot_buffer = torch.zeros((batch_size, N_ACTIONS), dtype=torch.float32, device=device)
-        self.repeat_counter = torch.zeros(batch_size, dtype=torch.float32, device=device)
+                
+        # Contiene l'ultima azione
         self.last_action = torch.full((batch_size,), -1, dtype=torch.long, device=device)
 
     def _load_sample_into_slot(self, slot, dataset_idx):
+        # Ottengo un elemento del dataset
         sample = self.dataset[dataset_idx % len(self.dataset)]
+
+        # Carico l'immagine attuale nel tensore
         self.current_images[slot] = sample["image"].to(self.device, non_blocking=True)
 
+        # Tolgo la prima dimensione della maschera
         mask = sample["mask"].squeeze(0)
+
+        # Ottengo tutti i pixel della maschera positiva
         pos = torch.where(mask > 0.5)
         if len(pos[0]) > 0:
+            # Ottengo i bordi della box
             ymin, ymax = torch.min(pos[0]), torch.max(pos[0])
             xmin, xmax = torch.min(pos[1]), torch.max(pos[1])
-            # gt_boxes in formato (x1, y1, x2, y2)
+
+            # Salvo la box
             self.gt_boxes[slot] = torch.tensor(
                 [xmin.float(), ymin.float(), xmax.float(), ymax.float()],
                 dtype=torch.float32, device=self.device
             )
         else:
+            print("AAAAA Box mancante")
+
+            # Creo una finta box
             self.gt_boxes[slot] = torch.tensor(
                 [self.W / 4, self.H / 4, 3 * self.W / 4, 3 * self.H / 4],
                 dtype=torch.float32, device=self.device
             )
 
-        # box iniziale = immagine intera (x1, y1, x2, y2)
+        # Definisco la box iniziale con dimensione l'intera immagine
         self.boxes[slot, 0] = 0.0
         self.boxes[slot, 1] = 0.0
         self.boxes[slot, 2] = float(self.W)
         self.boxes[slot, 3] = float(self.H)
 
+        # Azzero le variabili da utilizzare
         self.histories[slot].zero_()
         self.current_steps[slot] = 0
-        self.repeat_counter[slot] = 0
         self.last_action[slot] = -1
 
-    def reset_all(self, indices, epoch=None, total_epochs=None, force_max_difficulty=None, curriculum_override=None):
+    def reset_all(self, indices):
+        # Carico i campioni negli slot
         for i, idx in enumerate(indices):
             self._load_sample_into_slot(i, idx)
 
+        # Calcolo il centro delle box
         curr_centers = self.get_centers(self.boxes)
         gt_centers = self.get_centers(self.gt_boxes)
+
+        # Imposto le metriche da utilizzare nel codice
         self.previous_dists = torch.norm(curr_centers - gt_centers, dim=1)
         self.previous_ious = compute_iou_tensor(self.boxes, self.gt_boxes)
         self.previous_gious = compute_giou_tensor(self.boxes, self.gt_boxes)
@@ -297,21 +346,28 @@ class BatchedActiveLocalizationEnv:
         self.previous_cious = compute_ciou_tensor(self.boxes, self.gt_boxes)
         self.best_ious = self.previous_ious.clone()
         self.best_boxes = self.boxes.clone()
+
         return self._get_obs()
 
     def _get_obs(self):
+        # Ottengo le coordinate della box attuale
         x1, y1, x2, y2 = self.boxes[:, 0], self.boxes[:, 1], self.boxes[:, 2], self.boxes[:, 3]
 
+        # Calcolo una ROI attorno alla box
         rx1 = torch.clamp(x1 - CONTEXT_PIXELS, min=0, max=float(self.W))
         ry1 = torch.clamp(y1 - CONTEXT_PIXELS, min=0, max=float(self.H))
         rx2 = torch.clamp(x2 + CONTEXT_PIXELS, min=0, max=float(self.W))
         ry2 = torch.clamp(y2 + CONTEXT_PIXELS, min=0, max=float(self.H))
+        
+        # Evito che sia nulla
         rx2 = torch.maximum(rx2, rx1 + 1.0)
         ry2 = torch.maximum(ry2, ry1 + 1.0)
 
+        # Costruisco il tensore
         batch_idx = torch.arange(self.num_envs, device=self.device, dtype=torch.float32)
         rois = torch.stack([batch_idx, rx1, ry1, rx2, ry2], dim=1)
 
+        # Costruisco un vettore extra con la box e la progressione attuale
         extra = torch.stack([
             x1 / float(self.W),
             y1 / float(self.H),
@@ -320,156 +376,139 @@ class BatchedActiveLocalizationEnv:
             self.current_steps.float() / float(MAX_STEPS_PER_EPISODE),
         ], dim=1)
 
-        # Restituiamo le immagini intere e le coordinate RoI.
-        # Niente più roi_align sulle immagini originali!
         return {"images": self.current_images, "rois": rois, "histories": self.histories, "extra": extra}
-    
 
     def get_centers(self, boxes):
+        # Calcolo il centro delle box
         x_c = boxes[:, 0] + boxes[:, 2] / 2
         y_c = boxes[:, 1] + boxes[:, 3] / 2
         return torch.stack([x_c, y_c], dim=1)
     
     def _clamp_box(self, x1, y1, x2, y2):
+        # Evito che i bordi escano dall'immagine
         x1 = torch.clamp(x1, 0, self.W)
         y1 = torch.clamp(y1, 0, self.H)
         x2 = torch.clamp(x2, 0, self.W)
         y2 = torch.clamp(y2, 0, self.H)
+
+        # Impedisco che la box rimpicciolisca troppo
         x2 = torch.maximum(x2, x1 + 5)
         y2 = torch.maximum(y2, y1 + 5)
+
+        # Evito di nuovo che i bordi escano dall'immagine
         x2 = torch.clamp(x2, max=self.W)
         y2 = torch.clamp(y2, max=self.H)
         x1 = torch.minimum(x1, x2 - 5)
         y1 = torch.minimum(y1, y2 - 5)
+
         return x1, y1, x2, y2
 
     def step(self, actions):
-        # Maschera di fase calcolata PRIMA dell'incremento di current_steps, così
-        # riflette esattamente ciò che l'agente/oracolo hanno visto quando hanno
-        # scelto l'azione. Serve anche come rete di sicurezza: se per qualsiasi
-        # motivo arriva un'azione di shrink (4,5) non ammessa in questa fase
-        # dell'episodio, la neutralizziamo (no-op) invece di eseguirla.
+        # Aumento il numero dei passi
         self.current_steps += 1
 
-        same_action = (actions == self.last_action) & (actions < 8)
-        self.repeat_counter = torch.where(
-            same_action, self.repeat_counter + 1.0, torch.zeros_like(self.repeat_counter)
-        )
+        # Salvo l'azione corrente
         self.last_action = actions.clone()
 
+        # Pulisco il tensore e ci inserisco l'azione corrente
         self.one_hot_buffer.zero_()
         self.one_hot_buffer.scatter_(1, actions.unsqueeze(1), 1.0)
+
+        # Aggiunto l'azione appena effettuata
         self.histories = torch.cat([self.histories[:, N_ACTIONS:], self.one_hot_buffer], dim=1)
 
-        # w, h derivati dal box corrente (x1, y1, x2, y2)
+        # Derivo w e h dal box corrente (x1, y1, x2, y2)
         w, h = self.boxes[:, 2] - self.boxes[:, 0], self.boxes[:, 3] - self.boxes[:, 1]
-        # Passo per shrink/expand: resta proporzionale al box corrente (così diventa
-        # via via più fine man mano che il box si restringe, come da design originale).
-        #aw_size, ah_size = ALPHA * w, ALPHA * h
         
+        # Determino la dimensione degli spostamenti (diventano più fini man mano viene rimpicciolita la box)
         aw_size = torch.clamp(ALPHA * w, min=MIN_SCALE_PIXELS)
         ah_size = torch.clamp(ALPHA * h, min=MIN_SCALE_PIXELS)
-        # Passo per la traslazione: floor assoluto in pixel, indipendente dal size del
-        # box. Senza questo floor, un box già rimpicciolito ha step di traslazione
-        # minuscoli e non riesce più a percorrere un errore di posizione residuo entro
-        # i pochi step rimasti nell'episodio ("shrink trap").
         aw_move = torch.clamp(ALPHA * w, min=MIN_TRANSLATE_PIXELS)
         ah_move = torch.clamp(ALPHA * h, min=MIN_TRANSLATE_PIXELS)
- # delta espliciti sui 4 estremi (x1, y1, x2, y2)
+
+        # Variabili che conterranno la variazione in base all'azione
         dx1 = torch.zeros(self.num_envs, device=self.device)
         dy1 = torch.zeros(self.num_envs, device=self.device)
         dx2 = torch.zeros(self.num_envs, device=self.device)
         dy2 = torch.zeros(self.num_envs, device=self.device)
 
+        # Definisco delle maschere sul tipo di azioni
         m0 = (actions == 0); m1 = (actions == 1); m2 = (actions == 2); m3 = (actions == 3); m4 = (actions == 4); m5 = (actions == 5); m6 = (actions == 6); m7 = (actions == 7)
 
-        # traslazione destra/sinistra: entrambi gli estremi x si spostano insieme
+        # Spostamento a destra
         dx1[m0] = aw_move[m0]; dx2[m0] = aw_move[m0]
+
+        # Spostamento a sinistra
         dx1[m1] = -aw_move[m1]; dx2[m1] = -aw_move[m1]
 
-        # traslazione su/giù: entrambi gli estremi y si spostano insieme
+        # Spostamento in alto
         dy1[m2] = -ah_move[m2]; dy2[m2] = -ah_move[m2]
+
+        # Spostamento in basso
         dy1[m3] = ah_move[m3]; dy2[m3] = ah_move[m3]
 
-        # shrink orizzontale (centrato sull'asse x): x1 avanza, x2 arretra
+        # Shrink orizzontale: x1 avanza, x2 arretra
         dx1[m4] = aw_size[m4]; dx2[m4] = -aw_size[m4]
-        # shrink verticale (centrato sull'asse y): y1 avanza, y2 arretra
+
+        # Shrink verticale: y1 avanza, y2 arretra
         dy1[m5] = ah_size[m5]; dy2[m5] = -ah_size[m5]
 
-        # expand orizzontale (centrato): x1 arretra, x2 avanza
+        # Expand orizzontale: x1 arretra, x2 avanza
         dx1[m6] = -aw_size[m6]; dx2[m6] = aw_size[m6]
-        # expand verticale (centrato): y1 arretra, y2 avanza
+
+        # Expand verticale: y1 arretra, y2 avanza
         dy1[m7] = -ah_size[m7]; dy2[m7] = ah_size[m7]
 
+        # Calcolo le nuove coordinate
         new_x1 = self.boxes[:, 0] + dx1
         new_y1 = self.boxes[:, 1] + dy1
         new_x2 = self.boxes[:, 2] + dx2
         new_y2 = self.boxes[:, 3] + dy2
+
+        # Controllo che siano nei limiti dell'immagine
         new_x1, new_y1, new_x2, new_y2 = self._clamp_box(new_x1, new_y1, new_x2, new_y2)
 
+        # Aggiorno la box corrente
         self.boxes[:, 0] = new_x1
         self.boxes[:, 1] = new_y1
         self.boxes[:, 2] = new_x2
         self.boxes[:, 3] = new_y2
 
+        # Calcolo metriche sulla nuova box
         new_ious = compute_iou_tensor(self.boxes, self.gt_boxes)
-
         new_gious = compute_giou_tensor(self.boxes, self.gt_boxes)
         new_dious = compute_diou_tensor(self.boxes, self.gt_boxes)
         new_cious = compute_ciou_tensor(self.boxes, self.gt_boxes)
         
-        #giou_shaped = (new_dious*0.5+new_gious*0.5) - (self.previous_dious*0.5+self.previous_gious*0.5)
-        ciou_shaped=new_cious-self.previous_cious
-        rewards = ciou_shaped * 5.0 - 0.02
-        # 2. Piccola penalità per stallo/loop combinata
-        iou_delta = new_ious - self.previous_ious
+        # Calcolo la variazione di CIoU e assegno reward in base ad essa
+        ciou_variation = new_cious - self.previous_cious
+        rewards = ciou_variation * 5.0
 
-        # 3. Trigger reward semplice e forte
+        # Penalità per ogni step
+        rewards -= 0.02
+
+        # Assegno reward simmetrico alla terminazione (in base a soglia IoU)
         terminated = (actions == 8)
+
         rewards[terminated] = torch.where(
             new_ious[terminated] >= self.tau_iou,
-            3.0 + 10.0 * (new_ious[terminated] - self.tau_iou),  # bonus fino a 11
-            -3.0 - 10.0 * (self.tau_iou - new_ious[terminated])   # penalità fino a -13
+            3.0 + 10.0 * (new_ious[terminated] - self.tau_iou),
+            -3.0 - 10.0 * (self.tau_iou - new_ious[terminated])
         )
 
-        # 4. Nessuna penalità di regressione
-        
-        '''
-        curr_centers = self.get_centers(self.boxes)
-        gt_centers = self.get_centers(self.gt_boxes)
-        curr_dists = torch.norm(curr_centers - gt_centers, dim=1)
-
-        giou_shaped = (GAMMA * new_gious) - self.previous_gious
-        dist_shaped = self.previous_dists - (GAMMA * curr_dists)
-        rewards = (giou_shaped * 10.0) + (dist_shaped * 0.5)
-
-        stagnation_mask = (actions < 8) & (torch.abs(iou_diff) < 0.005)
-        stagnation_scale = torch.clamp(1.0 - (new_ious / self.tau_iou), min=0.0, max=1.0)
-        rewards[stagnation_mask] -= 0.05 * stagnation_scale[stagnation_mask]
-
-        loop_penalty = torch.clamp(self.repeat_counter - 3.0, min=0.0) * 0.08
-        rewards = rewards - loop_penalty
-
-        regressed_mask = (actions < 8) & ((self.previous_ious - new_ious) > 0)
-        rewards[regressed_mask] -=z * (self.best_ious[regressed_mask] - new_ious[regressed_mask])
-
-        terminated = (actions == 8)
-        good_trigger = terminated & (new_ious >= self.tau_iou)
-        bad_trigger = terminated & (new_ious < self.tau_iou)
-        rewards[good_trigger] += 5.0 + (new_ious[good_trigger] - self.tau_iou) * 10.0
-        remaining_steps = (MAX_STEPS_PER_EPISODE - self.current_steps.float())
-        rewards[bad_trigger] -= (1.0 + (self.tau_iou - new_ious[bad_trigger]) * 2.0) + (remaining_steps[bad_trigger] * 0.2)
-        
-
-        self.previous_dists = curr_dists.clone()
-
-        '''
+        # Calcolo ci sono esecuzioni migliori
         improved = new_ious > self.best_ious
+
+        # Per le esecuzioni migliori salvo i nuovi valori
         if improved.any():
             self.best_ious[improved] = new_ious[improved]
             self.best_boxes[improved] = self.boxes[improved].clone()
+
+        # Controllo se ci sono delle terminazinoi per step e assegno penalità
         truncated = (self.current_steps >= MAX_STEPS_PER_EPISODE) & (~terminated)
         rewards[truncated] -= 1.0 + 2.0 * torch.clamp(self.tau_iou - new_ious[truncated], min=0.0)
+
+        # Aggiorno i valori
         self.previous_ious = new_ious
         self.previous_gious = new_gious
         self.previous_dious = new_dious
