@@ -38,7 +38,7 @@ REWARD_NEGATIVE = -1.0
 TAU_IOU = 0.6
 GAMMA = 0.90
 EPSILON_START = 1.0
-EPSILON_END = 0.1
+EPSILON_END = 0.05
 REWARD_CLIP = 10.0
 EMBED_DIM = 512
 # extra_feats = [box coords/step (dall'env)] + [bias spaziale (dal feat_map, vedi
@@ -1240,7 +1240,7 @@ def train(args, device, train_ds, val_ds):
 
     total_training_steps = args.n_epochs * MAX_STEPS_PER_EPISODE
     if args.epsilon_decay_steps is None:
-        args.epsilon_decay_steps = max(1, int(total_training_steps * 0.3))
+        args.epsilon_decay_steps = max(1, int(total_training_steps * 0.1))
     total_optimizer_steps = max(total_training_steps * args.gradient_steps, 1)
     warmup_steps = max(int(0.05 * total_optimizer_steps), 1)
     warmup_scheduler = optim.lr_scheduler.LinearLR(
@@ -1302,9 +1302,11 @@ def train(args, device, train_ds, val_ds):
             writer.close()
             return checkpoint_dir, best_iou
         
-    def get_epsilon(step, total_steps):
-        decay_steps = max(1, args.epsilon_decay_steps)
-        return EPSILON_END + (EPSILON_START - EPSILON_END) * np.exp(-1.0 * step / decay_steps)
+    def get_epsilon(step, start):
+        # Calcola la discesa lineare
+        epsilon = EPSILON_START - step * (EPSILON_START - EPSILON_END) / 200
+        # Forza il valore a non scendere mai sotto "end"
+        return max(EPSILON_END, epsilon)
     
     def get_teacher_prob(epoch):
         # Decadimento esponenziale più veloce
@@ -1386,13 +1388,13 @@ def train(args, device, train_ds, val_ds):
         epoch_step_ious = []    # per mostrare IoU dello step corrente
 
         pbar = tqdm(range(MAX_STEPS_PER_EPISODE), desc="Training steps", leave=True)
+        epsilon = get_epsilon(epoch, args.n_epochs)
 
         for step in pbar:
             if not active_mask.any():
                 pbar.close()
                 break
 
-            epsilon = get_epsilon(global_step, total_training_steps)
 
             policy_net.set_inference_mode()
             with torch.no_grad():
