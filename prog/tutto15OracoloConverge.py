@@ -61,7 +61,7 @@ MIN_SCALE_PIXELS = 1.0
 # Profondità di lookahead dell'oracolo
 ORACLE_LOOKAHEAD_STEPS = 2
 
-# PER (Prioritized Experience Replay)
+# Coefficiente che stabilisce quanto far pesare le priorità
 PER_ALPHA = 0.6
 
 # Coefficiente iniziale per la correzione del bias di sampling
@@ -70,7 +70,7 @@ PER_BETA_START = 0.4
 # Coefficiente finale per la correzione del bias di sampling
 PER_BETA_END = 1.0
 
-# Priorità necessaria per la selezione degli elementi
+# Priorità necessaria per la selezione degli elementi (evità priorità zero)
 PER_EPS = 1e-5
 
 # n-step
@@ -698,21 +698,33 @@ class PrioritizedReplayMixin:
         # Escludo gli elementi vuoti o con poca priorità
         valid_priorities = self.priorities[:self.size].clamp(min=PER_EPS)
 
+        # Trasformo le priorità in probabilità
         probs = valid_priorities ** self.per_alpha
         probs = probs / probs.sum()
+
+        # Campiono gli elementi
         idx = torch.multinomial(probs, batch_size, replacement=True)
+
+        # Ottengo i pesi e li normalizzo
         is_weights = (self.size * probs[idx]).clamp(min=1e-8) ** (-self.per_beta)
         is_weights = is_weights / is_weights.max()
+
         return idx.to(self._priority_device), is_weights.to(self.device)
 
     def update_priorities(self, idx, td_errors):
+        # Metto idx nel giusto device
         idx = idx.to(self._priority_device)
+
+        # Calcolo la nuova priorità per gli elementi del batch
         new_p = td_errors.detach().abs().to(self._priority_device) + PER_EPS
+
+        # Aggiorno le priorità
         self.priorities[idx] = new_p
         self.max_priority = max(self.max_priority, new_p.max().item())
 
 class EmbeddingReplayBuffer(PrioritizedReplayMixin):
     def __init__(self, capacity, embed_dim, history_dim, device, coord_dim=COORD_FEAT_DIM):
+        # Inizializzazione del ReplayBuffer
         self.device = device
         self.capacity, self.pos, self.size = capacity, 0, 0
         self.embeds = torch.zeros((capacity, embed_dim), dtype=torch.float32, device=device)
@@ -729,9 +741,11 @@ class EmbeddingReplayBuffer(PrioritizedReplayMixin):
 
     def push_batch(self, embeds, histories, extra, actions, rewards, next_embeds, next_histories,
                    next_extra, terminals, is_expert):
+        # Determino la dimensione del batch e gli indici da usare
         b_size = embeds.shape[0]
         idx = (self.pos + torch.arange(b_size, device=self.device)) % self.capacity
 
+        # Copio i dati
         self.embeds[idx] = embeds
         self.next_embeds[idx] = next_embeds
         self.histories[idx] = histories
@@ -742,14 +756,21 @@ class EmbeddingReplayBuffer(PrioritizedReplayMixin):
         self.rewards[idx] = rewards
         self.terminals[idx] = terminals
         self.is_expert[idx] = is_expert
+
+        # Aggiorno le priorità
         self._per_mark_new(idx)
 
+        # Aggiorno le variabili
         self.pos = (self.pos + b_size) % self.capacity
         self.size = min(self.size + b_size, self.capacity)
 
     def sample_per(self, batch_size):
+        # Faccio sample di un batch
         idx, is_weights = self.sample_indices_per(batch_size)
+
+        # Uso il device corretto
         idx_dev = idx.to(self.device)
+
         return (
             self.embeds[idx_dev], self.histories[idx_dev], self.extra[idx_dev], self.actions[idx_dev],
             self.rewards[idx_dev], self.next_embeds[idx_dev], self.next_histories[idx_dev],
@@ -759,16 +780,15 @@ class EmbeddingReplayBuffer(PrioritizedReplayMixin):
 
     # Campionamento uniforme per quando il PER è disattivato
     def sample_uniform(self, batch_size):
+        # Genero un batch random
         idx = torch.randint(0, self.size, (batch_size,), device=self.device)
+
         return (
             self.embeds[idx], self.histories[idx], self.extra[idx], self.actions[idx],
             self.rewards[idx], self.next_embeds[idx], self.next_histories[idx],
             self.next_extra[idx], self.terminals[idx], self.is_expert[idx]
         )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. MODELLI
-# ─────────────────────────────────────────────────────────────────────────────
 def spatial_bias_features(feat_map):
     """feat_map: [B, C, H, W], la feature map del backbone PRIMA del pooling globale
     (es. l'uscita 512x7x7 di layer4 in ResNet18, la stessa passata a SpatialAttentionPool).
