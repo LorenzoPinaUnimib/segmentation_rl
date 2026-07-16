@@ -2,7 +2,7 @@
 
 # Relazione di Progetto di Sistemi Complessi: Modelli e Simulazione di Pina Lorenzo 894396 e Rancati Simone 900052
 
-# DA AGGIUNGERE spiegazione modello e reward, grafici andamento reward, spiegazione apprendimento agente RL, tipologie di modifiche che abbiamo provato e bibliografia
+Repository Github: https://github.com/LorenzoPinaUnimib/segmentation_rl
 
 Abbiamo modificato più volte modello, reward, decadimento di epsilon, dimensione box iniziale del modello, spazio delle azioni (con o senza terminazione), modalità di acquisizione feature dall'immagine, tentato curriculum learning.
 Aggiungere parte su descrizione dataset.

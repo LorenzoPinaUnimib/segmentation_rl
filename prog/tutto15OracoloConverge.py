@@ -790,57 +790,68 @@ class EmbeddingReplayBuffer(PrioritizedReplayMixin):
         )
 
 def spatial_bias_features(feat_map):
-    """feat_map: [B, C, H, W], la feature map del backbone PRIMA del pooling globale
-    (es. l'uscita 512x7x7 di layer4 in ResNet18, la stessa passata a SpatialAttentionPool).
-    Ritorna [B, SPATIAL_BIAS_DIM] feature di posizione esplicite e interpretabili, calcolate
-    da una mappa di "energia" (saliency grezza = media dei quadrati sui canali), invece di
-    lasciare che l'agente inferisca indirettamente "da che parte sta il contenuto rilevante"
-    dal solo embedding globale collassato:
-      - bias_lr, bias_tb: sbilanciamento sinistra/destra e alto/basso dell'energia, in [-1,1]
-        (positivo = più energia a sinistra/in alto).
-      - centroid_x, centroid_y: baricentro dell'attivazione (primo momento spaziale),
-        normalizzato in [0,1] sulla griglia.
-      - spread_x, spread_y: dispersione del baricentro (secondo momento, deviazione
-        standard), normalizzata sulla griglia.
-    Nessun parametro allenabile: solo operazioni tensoriali sulla mappa spaziale già
-    calcolata (tipicamente 7x7), quindi costo aggiuntivo trascurabile e nessun bisogno di
-    ri-addestrare il backbone."""
-    energy = feat_map.pow(2).mean(dim=1)  # [B, H, W] saliency grezza
+    # Determino l'energia per ogni immagine e posizione
+    energy = feat_map.pow(2).mean(dim=1)
     b, h, w = energy.shape
+
+    # Calcolo l'energia totale per ogni immagine
     total = energy.sum(dim=[1, 2]).clamp(min=1e-6)
 
+    # Normalizzo l'energia per ogni immagine
+    p = energy / total.view(b, 1, 1)
+
+    # Calcolo l'energia totale per la metà sinistra di ogni immagine
     left = energy[:, :, :w // 2].sum(dim=[1, 2])
+
+    # Calcolo l'energia totale per la metà destra di ogni immagine
     right = energy[:, :, w // 2:].sum(dim=[1, 2])
+
+    # Calcolo l'energia totale per la metà in alto di ogni immagine
     top = energy[:, :h // 2, :].sum(dim=[1, 2])
+
+    # Calcolo l'energia totale per la metà in basso di ogni immagine
     bottom = energy[:, h // 2:, :].sum(dim=[1, 2])
+
+    # Determino i bias dell'energia nell'immagine
     bias_lr = (left - right) / total
     bias_tb = (top - bottom) / total
 
+    # Determino il device utilizzato
     device = feat_map.device
+
+    # Creo le coordinate
     ys = torch.arange(h, device=device, dtype=torch.float32).view(1, h, 1)
     xs = torch.arange(w, device=device, dtype=torch.float32).view(1, 1, w)
-    p = energy / total.view(b, 1, 1)  # distribuzione "di probabilità" sulla griglia spaziale
 
+    # Calcolo i centroidi pesati in base all'energia
     centroid_y = (p * ys).sum(dim=[1, 2])
     centroid_x = (p * xs).sum(dim=[1, 2])
+
+    # Calcolo la varianza dell'energia rispetto ai centroidi
     var_y = (p * (ys - centroid_y.view(b, 1, 1)).pow(2)).sum(dim=[1, 2]).clamp(min=0.0)
     var_x = (p * (xs - centroid_x.view(b, 1, 1)).pow(2)).sum(dim=[1, 2]).clamp(min=0.0)
 
+    # Denominatori di normalizzazione
     norm_w = max(w - 1, 1)
     norm_h = max(h - 1, 1)
+
+    # Normalizzo i centroidi
     centroid_x_n = centroid_x / norm_w
     centroid_y_n = centroid_y / norm_h
+
+    # Normalizzo la varianza
     spread_x_n = var_x.sqrt() / norm_w
     spread_y_n = var_y.sqrt() / norm_h
 
     return torch.stack(
         [bias_lr, bias_tb, centroid_x_n, centroid_y_n, spread_x_n, spread_y_n], dim=1
-    )  # [B, SPATIAL_BIAS_DIM]
-
+    )
 
 class SpatialAttentionPool(nn.Module):
     def __init__(self, in_channels=512, embed_dim=512):
         super().__init__()
+
+        # Definisco le reti che verranno utilizzate
         self.refine = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(in_channels),
@@ -854,20 +865,37 @@ class SpatialAttentionPool(nn.Module):
         )
 
     def forward(self, feat_map):
+        # Raffino le feature
         refined = self.refine(feat_map)
+
+        # Calcolo i logits di attenzione per ogni posizione
         b, c, h, w = refined.shape
         attn = self.attn_logits(refined).view(b, 1, h * w)
+
+        # Normalizzo i logits
         attn = torch.softmax(attn, dim=-1).view(b, 1, h, w)
+
+        # Somma pesata delle attivazioni per canale 
         attn_pooled = (refined * attn).sum(dim=[2, 3])
+
+        # Media per canale
         avg_pooled = self.avg_pool(refined).view(b, c)
+
+        # Concateno le due rappresentazioni
         combined = torch.cat([attn_pooled, avg_pooled], dim=1)
+        
         return self.project(combined)
 
 class QNetwork(nn.Module):
     def __init__(self, embed_dim, history_dim, n_actions, hidden=512, coord_dim=COORD_FEAT_DIM):
         super().__init__()
+
         self.coord_dim = coord_dim
+
+        # Calcolo input della rete
         input_dim = embed_dim + history_dim + coord_dim
+
+        # Rete backbone condivisa
         self.shared = nn.Sequential(
             nn.Linear(input_dim, hidden),
             nn.LayerNorm(hidden),
@@ -876,11 +904,15 @@ class QNetwork(nn.Module):
             nn.LayerNorm(hidden),
             nn.ReLU(),
         )
+
+        # Rete per calcolare il valore dello stato
         self.value_stream = nn.Sequential(
             nn.Linear(hidden, hidden // 2),
             nn.ReLU(),
             nn.Linear(hidden // 2, 1)
         )
+
+        # Rete per calcolare il vantaggio di un'azione in uno stato
         self.advantage_stream = nn.Sequential(
             nn.Linear(hidden, hidden // 2),
             nn.ReLU(),
@@ -888,35 +920,47 @@ class QNetwork(nn.Module):
         )
 
     def forward(self, embeds, histories, extra_feats):
+        # Concateno gli input
         x = torch.cat([embeds, histories, extra_feats], dim=1)
+
+        # Li passo per le reti definite precedentemente
         x = self.shared(x)
         v = self.value_stream(x)
         a = self.advantage_stream(x)
+
+        # Calcolo i valori di Q
         return v + (a - a.mean(dim=1, keepdim=True))
 
 class PolicyNetwork(nn.Module):
     def __init__(self, history_dim, n_actions, pretrained_backbone=None, use_spatial_attention=None):
         super().__init__()
+
         from torchvision.models import resnet18, ResNet18_Weights
 
+        # Se non vengono specificati dei pesi uso i default
         weights = None if pretrained_backbone is not None else ResNet18_Weights.DEFAULT
 
+        # Carico i pesi nella resnet
         backbone = resnet18(weights=weights)
+
+        # Elimino avgpool e fc
         backbone.avgpool = nn.Identity()
         backbone.fc = nn.Identity()
+
+        # Salvo la rete e i relativi parametri
         self.backbone = backbone
         self._backbone_channels = 512
         self._backbone_spatial = WARP_SIZE[0] // 32
 
-        # Forza l'uso di SpatialAttentionPool se richiesto esplicitamente
         if use_spatial_attention is True:
+            # Uso SpatialAttentionPool
             self.spatial_pool = SpatialAttentionPool(in_channels=self._backbone_channels, embed_dim=EMBED_DIM)
             self.use_spatial_attention = True
         elif use_spatial_attention is False:
+            # Uso AdaptiveAvgPool
             self.spatial_pool = nn.AdaptiveAvgPool2d(1)
             self.use_spatial_attention = False
         else:
-            # Comportamento originale: decide in base al checkpoint del backbone preaddestrato
             if pretrained_backbone is not None:
                 checkpoint = torch.load(pretrained_backbone, map_location="cpu", weights_only=False)
                 if isinstance(checkpoint, dict):
