@@ -20,10 +20,12 @@ Repository Github: https://github.com/LorenzoPinaUnimib/segmentation_rl
    2. [Penalità per step](#62-penalità-per-step)
    3. [Ricompensa/punizione alla terminazione (azione stop)](#63-ricompensa-punizione-alla-terminazione-azione-stop)
    4. [Penalità per troncamento](#64-penalità-per-troncamento)
+   4. [Reward clipping](#65-reward-clipping)
 7. [Strategie di addestramento considerate](#7-strategie-di-addestramento-considerate)
    1. [Reinforcement Learning puro](#71-reinforcement-learning-puro)
    2. [Curriculum Learning](#72-curriculum-learning)
    3. [Imitation Learning con probabilità di guida (Teacher prob)](#73-imitation-learning-con-probabilità-di-guida-teacher-prob)
+   4. [Prioritized Experience Replay](#74-prioritized-experience-replay)
 8. [Risultati](#8-risultati)
 9. [Conclusioni](#9-conclusioni)
 
@@ -52,17 +54,20 @@ Il dataset contiene 2146 immagini ricavate da scansioni MRI di cervelli con tumo
 - 215 immagini in test;
 - 429 immagini in validation.
 
-Le immagini includono, oltre alla parte visiva, le informazioni necessarie alla supervisione sotto forma di bounding box associata al tumore.
+Le immagini includono, oltre alla parte visiva, le informazioni necessarie alla supervisione sotto forma di bounding box associata al tumore, usata sia come ground-truth per il calcolo della reward sia come riferimento per l'oracolo che guida l'Imitation Learning.
 
 ---
 
 ## 3. Formulazione del problema
 
-Ad ogni passo temporale t, l’agente osserva:
+Ad ogni passo temporale $t$, l’agente osserva:
 - l’immagine MRI;
-- lo stato corrente del bounding box, che rappresenta la localizzazione stimata del tumore.
+- lo stato corrente del bounding box, che rappresenta la localizzazione stimata del tumore;
+- la storia delle ultime azioni compiute (finestra scorrevole di 10 azioni, codificate one-hot).
 
-L’agente produce un’azione che modifica il bounding box, ottenendo un nuovo stato e ricevendo una reward. L’episodio si conclude quando l’agente seleziona l’azione di stop oppure quando viene raggiunto un limite massimo di passi.
+L’agente produce un’azione che modifica il bounding box, ottenendo un nuovo stato e ricevendo una reward. L’episodio si conclude quando l’agente seleziona l’azione di stop oppure quando viene raggiunto un limite massimo di 50 passi.
+
+La bounding box iniziale coincide con l'intera immagine, così da fornire all'agente un punto di partenza estremo e privo di bias, forzando un progressivo affinamento.
 
 La qualità della localizzazione è misurata tramite metriche di sovrapposizione tra la bounding box predetta e la bounding box di ground-truth, in particolare IoU e CIoU.
 
@@ -194,15 +199,24 @@ $$
 r_t \leftarrow r_t - \left(1 + 2 \cdot \max(\tau_{iou} - \text{IoU}_t, 0)\right).
 $$
 
+### 6.5. Reward clipping
+
+Per limitare la varianza dei ritorni e prevenire aggiornamenti instabili, la reward complessiva viene troncata nell'intervallo $[-10, 10]$.
+
 ---
 
 ## 7. Strategie di addestramento considerate
 
 Nel corso del progetto sono state esaminate e sperimentate differenti strategie di addestramento:
+- Reinforcement Learning puro;
+- Curriculum Learning;
+- Imitation Learning.
 
 ### 7.1. Reinforcement Learning puro
 
 In questa configurazione l’agente apprende direttamente dall’interazione con l’ambiente, ottimizzando la politica in funzione delle reward ricevute nel tempo.
+
+L'agente non ha alcun aiuto durante l’apprendimento: deve quindi scoprire da zero quali azioni (e soprattutto quali sequenze di azioni) portano a migliorare la qualità della predizione. Per questo motivo, il Reinforcement Learning puro tende ad essere più lento.
 
 ### 7.2. Curriculum Learning
 
@@ -210,9 +224,19 @@ Nel Curriculum Learning, la rete viene inizialmente addestrata su esempi più se
 
 ### 7.3. Imitation Learning con probabilità di guida (Teacher prob)
 
-È stato adottato Imitation Learning associato a una probabilità di essere guidati dal teacher (Teacher prob). L’agente sceglie, ad ogni epoca, una probabilità con cui le mosse vengono guidate dall’esperto. La probabilità decresce durante l’esecuzione: all’inizio l’agente viene orientato direttamente verso l’obiettivo, mentre successivamente viene progressivamente “costretto” ad apprendere autonomamente.
+Nell'Imitation Learning associato a una probabilità di essere guidati dal teacher (Teacher prob) l’agente sceglie, ad ogni epoca, una probabilità con cui le mosse vengono guidate dall’esperto.
+
+La probabilità decresce durante l’esecuzione: all’inizio l’agente viene orientato direttamente verso l’obiettivo, mentre successivamente viene progressivamente “costretto” ad apprendere autonomamente.
 
 Quando l’agente non è guidato dall’esperto, utilizza epsilon-greedy con probabilità $\epsilon$ di azione casuale, in modo da esplorare l’ambiente e stimare quali azioni risultino più efficaci.
+
+Abbiamo scelto questa modalità poiché era quella che ha portato i migliori risultati nell'apprendimento del modello e ridotto le tempistiche di addestramento.
+
+### 7.4. Prioritized Experience Replay
+
+Il replay buffer non campiona le transizioni passate in modo uniforme, ma secondo lo schema della Prioritized Experience Replay.
+
+La Prioritized Experience Replay concentra l'apprendimento sulle transizioni più "sorprendenti" e quindi più informative. La distorsione statistica introdotta dal campionamento non uniforme viene corretta tramite pesi di importance sampling, il cui esponente $\beta$ viene fatto crescere linearmente da 0.4 a 1.0 nel corso del training.
 
 ---
 
