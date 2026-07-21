@@ -31,6 +31,8 @@ Repository Github: https://github.com/LorenzoPinaUnimib/segmentation_rl
 
 ---
 
+\newpage
+
 ## 1. Introduzione
 
 Il progetto affronta il problema della localizzazione di un tumore cerebrale in immagini di risonanza magnetica (MRI) mediante metodi di Reinforcement Learning (RL).
@@ -45,6 +47,8 @@ Durante lo sviluppo sono state esplorate diverse modalità di allenamento:
 - Imitation Learning.
 
 ---
+
+\newpage
 
 ## 2. Dataset
 
@@ -72,6 +76,8 @@ La bounding box iniziale coincide con l'intera immagine, così da fornire all'ag
 La qualità della localizzazione è misurata tramite metriche di sovrapposizione tra la bounding box predetta e la bounding box di ground-truth, in particolare IoU e CIoU.
 
 ---
+
+\newpage
 
 ## 4. Metodologia
 
@@ -112,6 +118,8 @@ L’episodio inizia con una bounding box iniziale grande quanto l’intera immag
 
 ---
 
+\newpage
+
 ## 5. Metriche di sovrapposizione
 
 ### 5.1. Intersection over Union (IoU)
@@ -135,6 +143,8 @@ $$ \text{CIoU}=\text{IoU}-\frac{\rho^2(\mathbf{b},\mathbf{b}^{gt})}{c^2}-\alpha 
 La CIoU è risultata particolarmente utile perché, diversamente dalla IoU classica, fornisce un segnale più informativo anche quando la sovrapposizione è nulla. In tali casi, pur con IoU = 0, la CIoU continua a restituire indicazioni su direzione e qualità del movimento, rendendola idonea come base per il reward shaping.
 
 ---
+
+\newpage
 
 ## 6. Reward shaping
 
@@ -205,6 +215,8 @@ Per limitare la varianza dei ritorni e prevenire aggiornamenti instabili, la rew
 
 ---
 
+\newpage
+
 ## 7. Strategie di addestramento considerate
 
 Nel corso del progetto sono state esaminate e sperimentate differenti strategie di addestramento:
@@ -240,6 +252,8 @@ La Prioritized Experience Replay concentra l'apprendimento sulle transizioni pi�
 
 ---
 
+\newpage
+
 ## 8. Risultati
 
 Dopo aver eseguito il training dell’agente per 150 epoche (ciascuna su un batch di 32 immagini) abbiamo osservato buoni risultati in termini di apprendimento del modello.
@@ -267,6 +281,8 @@ Nel complesso, questi risultati sono particolarmente incoraggianti considerando 
 
 ---
 
+\newpage
+
 ## 9. Conclusioni
 
 L’approccio proposto affronta la localizzazione di un tumore cerebrale come un problema sequenziale di decisione, in cui l’agente aggiorna iterativamente un bounding box tramite azioni discrete. La formulazione in termini di MDP consente di ottimizzare la politica massimizzando la somma delle reward nel tempo.
@@ -280,6 +296,8 @@ In fase di training, l’integrazione tra Teacher prob e meccanismi di esplorazi
 Nel complesso, il progetto dimostra come un framework basato su RL, opportunamente guidato da reward shaping e tecniche ibride di addestramento, sia in grado di raggiungere performance solide nella localizzazione del tumore tramite raffinamento progressivo della bounding box.
 
 ---
+
+\newpage
 
 ## 10. Bibliografia
 
