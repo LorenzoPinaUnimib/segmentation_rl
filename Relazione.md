@@ -92,7 +92,7 @@ Le immagini vengono ridimensionate a una risoluzione fissa di 224×224×3 pixel,
 
 Per ogni immagine viene eseguita la normalizzazione (min-max) e la maschera viene binarizzata con soglia 0.5.
 
-> 🔲 Placeholder — Tabella 1. Statistiche descrittive delle dimensioni delle box di ground truth (area media, area mediana, rapporto larghezza/altezza) calcolate sul training set.
+>  Placeholder — Tabella 1. Statistiche descrittive delle dimensioni delle box di ground truth (area media, area mediana, rapporto larghezza/altezza) calcolate sul training set.
 
 ---
 
@@ -435,21 +435,27 @@ L'agente apprende esclusivamente dall'interazione con l'ambiente e dal segnale d
 
 ### 11.2 Curriculum Learning sulla soglia di successo
 
-La soglia di IoU richiesta per considerare "corretto" un trigger (usata sia dall'oracolo per decidere quando fermarsi sia come criterio di successo interno all'ambiente) non è fissa ma segue un curriculum: parte da un valore più permissivo (0.6) e cresce linearmente fino al valore obiettivo (0.8) entro una frazione configurabile delle epoche totali (pari al 60%). L'idea è permettere all'agente di consolidare prima una politica di localizzazione approssimativa, per poi essere gradualmente spinto verso una precisione maggiore.
+La soglia di IoU richiesta per considerare corretto un trigger (usata sia dall'oracolo per decidere quando fermarsi sia come criterio di successo interno all'ambiente) non è fissa ma segue un curriculum: parte da un valore più permissivo (0.6) e cresce linearmente fino al valore obiettivo (0.8) entro una frazione configurabile delle epoche totali (pari al 60%).
+
+L'idea è permettere all'agente di consolidare prima una politica di localizzazione approssimativa, per poi essere gradualmente spinto verso una precisione maggiore.
 
 ### 11.3 Imitation Learning guidato da un oracolo con lookahead
 
-Ad ogni epoca, con probabilità decrescente (stesso schema di decadimento lineare di $\varepsilon$, con un valore minimo residuo), l'azione eseguita non è quella scelta dalla policy ma quella suggerita da un oracolo. L'oracolo non si limita a un criterio greedy a un passo, ma esegue una ricerca ad albero (lookahead planning) di profondità configurabile (pari a 3 passi): per ciascuna delle 8 azioni di movimento candidate, simula ricorsivamente le conseguenze fino alla profondità massima consentita (o fino al raggiungimento della soglia di successo, o del budget di step residuo), valutando ciascun nodo con la CIoU e propagando all'indietro il massimo valore raggiungibile dai figli (schema di tipo *best-first / minimax degenere* senza avversario). L'azione radice scelta è quella che massimizza il valore atteso a fine ricerca; se la IoU corrente è già sopra soglia, l'oracolo restituisce direttamente l'azione di stop.
+Ad ogni epoca, con probabilità decrescente (stesso schema di decadimento lineare di $\varepsilon$, con un valore minimo residuo), l'azione eseguita non è quella scelta dalla policy ma quella suggerita da un oracolo.
 
-Le transizioni generate mentre l'agente è guidato dall'oracolo vengono marcate con un'etichetta di provenienza esperta, utilizzata sia per il salvataggio nel replay buffer sia per la margin loss descritta di seguito.
+L'oracolo non si limita a un criterio greedy a un passo, ma esegue una ricerca ad albero (lookahead planning) di profondità configurabile (pari a 3 passi): per ciascuna delle 8 azioni di movimento candidate, simula ricorsivamente le conseguenze fino alla profondità massima consentita (o fino al raggiungimento della soglia di successo, o del budget di step residuo), valutando ciascun nodo con la CIoU e propagando all'indietro il massimo valore raggiungibile dai figli. L'azione radice scelta è quella che massimizza il valore atteso a fine ricerca; se la IoU corrente è già sopra soglia, l'oracolo restituisce direttamente l'azione di stop.
+
+Le transizioni generate mentre l'agente è guidato dall'oracolo vengono marcate con un'etichetta, utilizzata sia per il salvataggio nel replay buffer sia per la margin loss descritta di seguito.
 
 ### 11.4 Esplorazione epsilon-greedy residuale
 
-Quando una transizione non è guidata dall'oracolo, l'azione è comunque soggetta a esplorazione $\varepsilon$-greedy standard: con probabilità $\varepsilon$ viene scelta un'azione casuale uniforme fra le 9 disponibili, altrimenti l'azione greedy della policy corrente. Questo garantisce che l'agente continui a esplorare autonomamente anche nelle fasi in cui il teacher è ancora relativamente presente.
+Quando una transizione non è guidata dall'oracolo, l'azione è comunque soggetta a esplorazione $\varepsilon$-greedy standard: con probabilità $\varepsilon$ viene scelta un'azione casuale uniforme fra le 9 disponibili, altrimenti l'azione greedy della policy corrente.
+
+Questo garantisce che l'agente continui a esplorare autonomamente anche nelle fasi in cui il teacher è ancora relativamente presente.
 
 ### 11.5 Margin loss in stile DQfD
 
-Per le transizioni marcate come provenienti dall'oracolo, alla loss TD viene sommato un termine di margin loss ispirato a DQfD [8], che spinge il Q-value dell'azione dimostrata dall'oracolo ad essere superiore di almeno un margine fisso (pari a 0.8) rispetto a quello di qualunque altra azione:
+Per le transizioni marcate come provenienti dall'oracolo, alla loss TD viene sommato un termine di margin loss che spinge il Q-value dell'azione dimostrata dall'oracolo ad essere superiore di almeno un margine fisso (pari a 0.8) rispetto a quello di qualunque altra azione:
 
 $$
 \mathcal{L}_{\text{margin}} = \mathbb{E}_{i \in \text{expert}}\left[\max_{a}\Big(Q(s_i,a) + \ell(a_E, a)\Big) - Q(s_i, a_E)\right], \qquad \ell(a_E,a) = \begin{cases} 0 & a = a_E \\ m & a \neq a_E \end{cases}
@@ -461,9 +467,9 @@ $$
 
 Questo termine accelera l'apprendimento imitativo delle azioni suggerite dall'oracolo, complementando il segnale, più lento, propagato dalla sola loss TD.
 
-> 🔲 Placeholder — Figura 5. Andamento nel tempo della probabilità di guida dell'oracolo, del tasso di esplorazione e della soglia di successo durante il curriculum (grafico a tre curve sovrapposte, da TensorBoard).
-
 ---
+
+\newpage
 
 ## 12. Setup sperimentale
 
@@ -488,9 +494,13 @@ Questo termine accelera l'apprendimento imitativo delle azioni suggerite dall'or
 | Soglia di successo (reward terminazione) | 0.6 |
 | Soglia di successo (valutazione IoU) | 0.6 |
 
-L'addestramento è monitorato tramite TensorBoard, con log per-step (IoU/GIoU/DIoU correnti, $\varepsilon$, probabilità di guida dell'oracolo, deviazione standard del reward scaler) e per-epoca (metriche finali e "migliori durante l'episodio" di training e validation, loss media, success rate). I checkpoint includono lo stato di policy network, target network, ottimizzatore, scheduler e reward scaler, per consentire la ripresa dell'addestramento.
+L'addestramento è monitorato tramite TensorBoard, con log per-step (IoU / GIoU / DIoU / CIoU correnti, $\varepsilon$, probabilità di guida dell'oracolo, deviazione standard del reward scaler) e per-epoca (metriche finali e "migliori durante l'episodio" di training e validation, loss media, success rate).
+
+I checkpoint includono lo stato di policy network, target network, ottimizzatore, scheduler e reward scaler, per consentire la ripresa dell'addestramento.
 
 ---
+
+\newpage
 
 ## 13. Risultati
 
@@ -500,19 +510,19 @@ Dopo l'addestramento per 150 epoche (batch da 32 immagini per epoca), si osserva
 - la reward di validation parte invece da valori negativi (circa −3, coerentemente con un agente ancora poco addestrato e privo di guida del teacher in valutazione) e cresce monotonicamente nel corso delle epoche, raggiungendo una media di circa 1.5;
 - la IoU media in validation si assesta, verso la fine dell'addestramento, attorno al 55%.
 
-> 🔲 Placeholder — Figura 6. Curva della reward media di training vs. epoca (dal log TensorBoard corrispondente).
+>  Placeholder — Figura 6. Curva della reward media di training vs. epoca (dal log TensorBoard corrispondente).
 
-> 🔲 Placeholder — Figura 7. Curva della reward media di validation vs. epoca (dai log TensorBoard corrispondenti).
+>  Placeholder — Figura 7. Curva della reward media di validation vs. epoca (dai log TensorBoard corrispondenti).
 
-> 🔲 Placeholder — Figura 8. Curva della IoU media (finale e migliore durante l'episodio) di validation vs. epoca.
+>  Placeholder — Figura 8. Curva della IoU media (finale e migliore durante l'episodio) di validation vs. epoca.
 
-> 🔲 Placeholder — Tabella 3. Metriche finali sul test set, generate dalla procedura di test (colonne: IoU media±dev.std./max, GIoU, DIoU, reward totale, numero di step medio, success rate a soglia 0.6, percentuale di episodi terminati con trigger esplicito vs. troncati) — da compilare a partire dal file riassuntivo dei risultati di test.
+>  Placeholder — Tabella 3. Metriche finali sul test set, generate dalla procedura di test (colonne: IoU media±dev.std./max, GIoU, DIoU, reward totale, numero di step medio, success rate a soglia 0.6, percentuale di episodi terminati con trigger esplicito vs. troncati) — da compilare a partire dal file riassuntivo dei risultati di test.
 
-> 🔲 Placeholder — Figura 9. Esempi qualitativi di traiettorie dell'agente (sequenza di box durante un episodio) su 2–3 immagini di test, incluso almeno un caso di successo e un caso di fallimento.
+>  Placeholder — Figura 9. Esempi qualitativi di traiettorie dell'agente (sequenza di box durante un episodio) su 2–3 immagini di test, incluso almeno un caso di successo e un caso di fallimento.
 
 ---
 
-## 14. Analisi e discussione
+## 14. Analisi e discussione (da qua in poi da rivedere in base alle immagini scelte)
 
 Il calo iniziale della reward di training tra le epoche 0–50 è coerente con l'atteso: mentre la probabilità di guida dell'oracolo decresce, l'agente perde progressivamente il supporto dell'oracolo e deve fare maggiore affidamento sulla propria politica, ancora poco raffinata, generando episodi meno efficienti (più step, terminazioni premature o tardive). La successiva ripresa suggerisce che il segnale TD, combinato con il curriculum sulla soglia di successo e con la margin loss DQfD sulle transizioni residue dell'oracolo, sia sufficiente a consolidare una politica autonoma via via più competente.
 
@@ -520,16 +530,20 @@ Il gap iniziale negativo della reward di validation (assente in training grazie 
 
 Un valore di IoU media attorno al 55% è ragionevole considerando: (i) la risoluzione discreta e relativamente grossolana dei movimenti disponibili (passi proporzionali al 10% della dimensione corrente, con soglia minima assoluta), che limita la precisione fine raggiungibile; (ii) l'eterogeneità del dataset, che include presumibilmente casi con tumori molto piccoli o dai contorni poco definiti, più difficili da localizzare con un bounding box.
 
-> 🔲 Placeholder — Analisi aggiuntiva. Confronto tra le run con e senza componenti (ablation): PER on/off, DQfD margin on/off, curriculum tau on/off, spatial attention vs. average pooling — da inserire se sono disponibili i log delle run comparative corrispondenti (eseguite disattivando singolarmente ciascun componente).
+>  Placeholder — Analisi aggiuntiva. Confronto tra le run con e senza componenti (ablation): PER on/off, DQfD margin on/off, curriculum tau on/off, spatial attention vs. average pooling — da inserire se sono disponibili i log delle run comparative corrispondenti (eseguite disattivando singolarmente ciascun componente).
 
 ---
+
+\newpage
 
 ## 15. Limiti e sviluppi futuri
 
-- Immagini 2D: il sistema opera su singole slice MRI; un'estensione a volumi 3D (o a sequenze di slice) potrebbe sfruttare informazione di contesto assiale aggiuntiva.
-- Singola box per immagine: l'ambiente assume un solo tumore/regione di interesse per immagine; casi multi-lesione richiederebbero un'estensione dello spazio delle azioni o un meccanismo multi-agente/multi-box.
+- Immagini 2D: il sistema opera su singole slice MRI; un'estensione a volumi 3D potrebbe sfruttare informazione di contesto aggiuntiva.
+- Singola box per immagine: l'ambiente assume un solo tumore / regione di interesse per immagine; casi multi-lesione richiederebbero un'estensione dello spazio delle azioni o un meccanismo multi-agente/multi-box.
 
 ---
+
+\newpage
 
 ## 16. Conclusioni
 
@@ -537,14 +551,16 @@ Il progetto formula la localizzazione di tumori cerebrali su MRI come un problem
 
 ---
 
+\newpage
+
 ## 17. Bibliografia
 
 Applicazioni RL alla localizzazione/segmentazione medicale e visiva
 
-1. Stember, J.N., Shalu, H. *Reinforcement learning using Deep networks and learning accurately localizes brain tumors on MRI with very small training sets* (2022). DOI: 10.1186/s12880-022-00919-x
-2. Ding, Y., Qin, X., Zhang, M., Geng, J., Chen, D., Deng, F., Song, C. *RLSegNet: A Medical Image Segmentation Network Based on Reinforcement Learning* (2023). IEEE/ACM Transactions on Computational Biology and Bioinformatics. DOI: 10.1109/TCBB.2022.3195705
-3. Stember, J.N., Shalu, H. *Deep reinforcement learning to detect brain lesions on MRI: a proof-of-concept application of reinforcement learning to medical images* (2020). arXiv:2008.02708
-4. Caicedo, J.C., Lazebnik, S. *Active Object Localization with Deep Reinforcement Learning* (2015). ICCV. arXiv:1511.06015
+1. Stember, J.N., Shalu, H.. Reinforcement learning using Deep networks and learning accurately localizes brain tumors on MRI with very small training sets (2022). DOI 10.1186/s12880-022-00919-x, https://doi.org/10.1186/s12880-022-00919-x
+2. Ding, Yi and Qin, Xue and Zhang, Mingfeng and Geng, Ji and Chen, Dajiang and Deng, Fuhu and Song, Chunhe. RLSegNet: An Medical Image Segmentation Network Based on Reinforcement Learning (2023). DOI 10.1109/TCBB.2022.3195705, https://ieeexplore-ieee-org.unimib.idm.oclc.org/abstract/document/9847069
+3. Joseph Stember, Hrithwik Shalu. Deep reinforcement learning to detect brain lesions on MRI: a proof-of-concept application of reinforcement learning to medical images (2008). DOI 10.48550/arXiv.2008.02708, https://doi.org/10.48550/arXiv.2008.02708
+4. Juan C. Caicedo, Svetlana Lazebnik. Active Object Localization with Deep Reinforcement Learning (2015). DOI 10.48550/arXiv.1511.06015, https://doi.org/10.48550/arXiv.1511.06015
 
 Componenti algoritmiche del Deep Reinforcement Learning
 
@@ -554,12 +570,4 @@ Componenti algoritmiche del Deep Reinforcement Learning
 8. Hester, T. et al. *Deep Q-learning from Demonstrations* (2018). AAAI. arXiv:1704.03732
 9. Hessel, M., Modayil, J., van Hasselt, H., Schaul, T., Ostrovski, G., Dabney, W., Horgan, D., Piot, B., Azar, M., Silver, D. *Rainbow: Combining Improvements in Deep Reinforcement Learning* (2018). AAAI. arXiv:1710.02298
 
-Metriche e loss per bounding box
-
-10. Zheng, Z., Wang, P., Liu, W., Li, J., Ye, R., Ren, D. *Distance-IoU Loss: Faster and Better Learning for Bounding Box Regression* (2020). AAAI. arXiv:1911.08287
-11. Rezatofighi, H., Tsoi, N., Gwak, J., Sadeghian, A., Reid, I., Savarese, S. *Generalized Intersection over Union: A Metric and A Loss for Bounding Box Regression* (2019). CVPR. arXiv:1902.09630
-12. He, K., Gkioxari, G., Dollár, P., Girshick, R. *Mask R-CNN* (2017). ICCV. (introduce RoI Align) arXiv:1703.06870
-
 ---
-
-> Nota per la compilazione finale. I blocchi contrassegnati con 🔲 sono placeholder da sostituire con i grafici esportati da TensorBoard e con le tabelle numeriche ricavate dai file riassuntivi prodotti dalla procedura di test, prima della consegna della relazione definitiva.
