@@ -220,11 +220,24 @@ Quando l’agente non è guidato dall’esperto, utilizza epsilon-greedy con pro
 
 Dopo aver eseguito il training dell’agente per 150 epoche (ciascuna su un batch di 32 immagini) abbiamo osservato buoni risultati in termini di apprendimento del modello.
 
-Durante l’addestramento, come atteso, la reward inizia con valori elevati grazie all’uso del Teacher e tende a diminuire progressivamente fino a circa l’epoca 50. Dopo questa fase, la reward mostra una ripresa e successivamente si assesta intorno a un valore prossimo a 2.
+![Train Reward](Immagini/Train_Reward.png)
 
-Nella validation, la reward parte invece da valori negativi (circa -3) e continua ad aumentare nel corso delle epoche, raggiungendo una media di circa 1,5.
+Durante l’addestramento, come atteso, la reward inizia con valori elevati grazie all’uso del Teacher e tende a diminuire progressivamente fino a circa l’epoca 50. Dopo questa fase, la reward mostra una ripresa e successivamente si assesta intorno a un valore prossimo a 4.
 
-Anche la metrica IoU, calcolata sulla validation (sempre su un batch di 32 immagini), tende ad assestarsi verso la fine dell’esecuzione, attestandosi intorno al 55% medio.
+![Validation Reward](Immagini/Val_Reward.png)
+
+Nella validation, la reward parte invece da valori negativi (circa -5) e continua ad aumentare nel corso delle epoche, raggiungendo una media di circa 1.
+
+![Train Final IoU](Immagini/Train_Final_IoU.png)
+![Validation Final IoU](Immagini/Val_Final_IoU.png)
+
+Anche la metrica IoU, calcolata sulla validation (sempre su un batch di 32 immagini), tende ad assestarsi verso la fine dell’esecuzione, attestandosi intorno al 52% medio.
+
+![Validation Step Avg](Immagini/Val_Step_Avg.png)
+
+Guadando il grafico relativo ai passi medi degli agenti nella validation notiamo come l'agente tende a terminare mediamente a 23 passi.
+
+![Train Epsilon](Immagini/Train_Epsilon.png)
 
 Nel complesso, questi risultati sono particolarmente incoraggianti considerando la limitata risoluzione dei passi dell’agente e la possibile presenza di immagini più complicate nel dataset.
 

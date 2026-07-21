@@ -508,7 +508,7 @@ class BatchedActiveLocalizationEnv:
             self.best_ious[improved] = new_ious[improved]
             self.best_boxes[improved] = self.boxes[improved].clone()
 
-        # Controllo se ci sono delle terminazinoi per step e assegno penalità
+        # Controllo se ci sono delle terminazioni per step e assegno penalità
         truncated = (self.current_steps >= MAX_STEPS_PER_EPISODE) & (~terminated)
         rewards[truncated] -= 1.0 + 2.0 * torch.clamp(self.tau_iou - new_ious[truncated], min=0.0)
 
@@ -963,6 +963,7 @@ class PolicyNetwork(nn.Module):
         else:
             if pretrained_backbone is not None:
                 checkpoint = torch.load(pretrained_backbone, map_location="cpu", weights_only=False)
+
                 if isinstance(checkpoint, dict):
                     backbone_state_dict = checkpoint.get("backbone_state_dict", checkpoint)
                     spatial_pool_state_dict = checkpoint.get("spatial_pool_state_dict", None)
@@ -1376,7 +1377,7 @@ def train(args, device, train_ds, val_ds):
         
     def get_epsilon(step, start):
         # Calcola la discesa lineare
-        epsilon = EPSILON_START - step * (EPSILON_START - EPSILON_END) / 200
+        epsilon = EPSILON_START - step * (EPSILON_START - EPSILON_END) / 110
         # Forza il valore a non scendere mai sotto "end"
         return max(EPSILON_END, epsilon)
     
