@@ -497,7 +497,7 @@ class BatchedActiveLocalizationEnv:
         rewards[terminated] = torch.where(
             new_ious[terminated] >= self.tau_iou,
             3.0 + 10.0 * (new_ious[terminated] - self.tau_iou),
-            -3.0 - 10.0 * (self.tau_iou - new_ious[terminated])
+            -3.0 + 10.0 * (new_ious[terminated] - self.tau_iou)
         )
 
         # Calcolo ci sono esecuzioni migliori
@@ -1041,7 +1041,7 @@ class PolicyNetwork(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. VALIDAZIONE (solo metriche finali)
 # ─────────────────────────────────────────────────────────────────────────────
-def validate(env, policy_net, val_indices, device, writer, global_step, epoch, n_epochs, tag="Validation"):
+def validate(env, policy_net, val_indices, device, writer, epoch, n_epochs, tag="Validation"):
     policy_net.eval()
     policy_net.set_inference_mode()
 
@@ -1106,24 +1106,24 @@ def validate(env, policy_net, val_indices, device, writer, global_step, epoch, n
     print(f"[Epoch {epoch}] {tag} (fine episodio) - "
           f"Final IoU: {final_avg_iou:.4f}, Best IoU: {final_best_iou:.4f}, Success Rate: {success_rate:.4f}")
 
-    writer.add_scalar(f"{tag}/Final_Avg_IoU", final_avg_iou, global_step)
-    writer.add_scalar(f"{tag}/Final_Std_IoU", final_std_iou, global_step)
-    writer.add_scalar(f"{tag}/Final_Best_IoU", final_best_iou, global_step)
-    writer.add_scalar(f"{tag}/Final_Avg_DIoU", final_avg_diou, global_step)
-    writer.add_scalar(f"{tag}/Final_Std_DIoU", final_std_diou, global_step)
-    writer.add_scalar(f"{tag}/Final_Best_DIoU", final_best_diou, global_step)
-    writer.add_scalar(f"{tag}/Final_Avg_GIoU", final_avg_giou, global_step)
-    writer.add_scalar(f"{tag}/Final_Std_GIoU", final_std_giou, global_step)
-    writer.add_scalar(f"{tag}/Final_Best_GIoU", final_best_giou, global_step)
-    writer.add_scalar(f"{tag}/Success_Rate", success_rate, global_step)
+    writer.add_scalar(f"{tag}/Final_Avg_IoU", final_avg_iou, epoch)
+    writer.add_scalar(f"{tag}/Final_Std_IoU", final_std_iou, epoch)
+    writer.add_scalar(f"{tag}/Final_Best_IoU", final_best_iou, epoch)
+    writer.add_scalar(f"{tag}/Final_Avg_DIoU", final_avg_diou, epoch)
+    writer.add_scalar(f"{tag}/Final_Std_DIoU", final_std_diou, epoch)
+    writer.add_scalar(f"{tag}/Final_Best_DIoU", final_best_diou, epoch)
+    writer.add_scalar(f"{tag}/Final_Avg_GIoU", final_avg_giou, epoch)
+    writer.add_scalar(f"{tag}/Final_Std_GIoU", final_std_giou, epoch)
+    writer.add_scalar(f"{tag}/Final_Best_GIoU", final_best_giou, epoch)
+    writer.add_scalar(f"{tag}/Success_Rate", success_rate, epoch)
     
-    writer.add_scalar(f"{tag}/Reward_mean", mean_reward, global_step)
-    writer.add_scalar(f"{tag}/Reward_std", std_reward, global_step)
-    writer.add_scalar(f"{tag}/Reward_max", max_reward, global_step)
+    writer.add_scalar(f"{tag}/Reward_Mean", mean_reward, epoch)
+    writer.add_scalar(f"{tag}/Reward_Std", std_reward, epoch)
+    writer.add_scalar(f"{tag}/Reward_Max", max_reward, epoch)
     
-    writer.add_scalar(f"{tag}/Step_max", max_step, global_step)
-    writer.add_scalar(f"{tag}/Step_std", std_step, global_step)
-    writer.add_scalar(f"{tag}/Step_avg", mean_step, global_step)
+    writer.add_scalar(f"{tag}/Step_Max", max_step, epoch)
+    writer.add_scalar(f"{tag}/Step_Std", std_step, epoch)
+    writer.add_scalar(f"{tag}/Step_Avg", mean_step, epoch)
 
     policy_net.train()
       # Ritorna tutte le metriche in un dizionario
@@ -1245,20 +1245,17 @@ def train(args, device, train_ds, val_ds):
         p.requires_grad_(False)
 
     optimizer = optim.AdamW(policy_net.head.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-
-    total_training_steps = args.n_epochs * MAX_STEPS_PER_EPISODE
-    if args.epsilon_decay_steps is None:
-        args.epsilon_decay_steps = max(1, int(total_training_steps * 0.25))
-    total_optimizer_steps = max(total_training_steps * args.gradient_steps, 1)
-    warmup_steps = max(int(0.05 * total_optimizer_steps), 1)
+    if args.epsilon_decay_epochs is None:
+        args.epsilon_decay_epochs = max(1, int(args.n_epochs * 0.25))
+    warmup_epochs = max(1, int(0.05 * args.n_epochs))
     warmup_scheduler = optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps
+        optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
     )
     cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(total_optimizer_steps - warmup_steps, 1), eta_min=args.learning_rate * 0.05
+        optimizer, T_max=max(args.n_epochs - warmup_epochs, 1), eta_min=args.learning_rate * 0.05
     )
     scheduler = optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps]
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs]
     )
 
     memory = EmbeddingReplayBuffer(args.replay_buffer_size, EMBED_DIM,
@@ -1295,6 +1292,8 @@ def train(args, device, train_ds, val_ds):
                 print("  [✓] Stato scheduler ripristinato")
             except Exception as e:
                 print(f"  [!] Impossibile ripristinare lo scheduler: {e}")
+                for _ in range(start_epoch):
+                    scheduler.step()
 
         # Ripristina il reward scaler (media/varianza online)
         if 'reward_scaler_state' in checkpoint:
@@ -1310,13 +1309,13 @@ def train(args, device, train_ds, val_ds):
             writer.close()
             return checkpoint_dir, best_iou
         
-    def get_epsilon(step):
-        decay_steps = max(1, args.epsilon_decay_steps)
-        return EPSILON_END + (EPSILON_START - EPSILON_END) * np.exp(-1.0 * step / decay_steps)
+    def get_epsilon(epoch):
+        decay_epochs = max(1, args.epsilon_decay_epochs)  # es. args.n_epochs * 0.25
+        return EPSILON_END + (EPSILON_START - EPSILON_END) * np.exp(-1.0 * epoch / decay_epochs)
     
-    def get_teacher_prob(epoch):
-        # Decadimento esponenziale più veloce
-        return max(args.teacher_prob_floor, EPSILON_END + (1.0 - EPSILON_END)* math.exp(-epoch / 50))
+    def get_teacher_prob(epoch, n_epochs, decay_frac=0.25):
+        decay_epochs = max(1, n_epochs * decay_frac)
+        return max(args.teacher_prob_floor, EPSILON_END + (1.0 - EPSILON_END) * math.exp(-epoch / decay_epochs))
 
     def get_tau_iou(epoch):
         if not args.use_tau_curriculum:
@@ -1324,8 +1323,8 @@ def train(args, device, train_ds, val_ds):
         factor = min(1.0, epoch / (args.n_epochs * args.curriculum_ramp_frac))
         return args.tau_iou_start + (TAU_IOU - args.tau_iou_start) * factor
 
-    def get_per_beta(step, total_steps):
-        frac = min(1.0, step / max(total_steps, 1))
+    def get_per_beta(epoch, n_epochs):
+        frac = min(1.0, epoch / max(n_epochs, 1))
         return PER_BETA_START + (PER_BETA_END - PER_BETA_START) * frac
 
     reward_scaler = RunningMeanStd(device=device)
@@ -1359,9 +1358,13 @@ def train(args, device, train_ds, val_ds):
         step_counts = torch.zeros(args.batch_size, device=device)   # contatore step per slot
         print(f"\n[Epoch {epoch + 1}/{args.n_epochs}]")
 
-        p_teacher = get_teacher_prob(epoch)
+        p_teacher = get_teacher_prob(epoch, args.n_epochs)
         writer.add_scalar("Train/Teacher_Prob", p_teacher, epoch)
         print(f"  [INFO] Teacher prob: {p_teacher:.3f}")
+        
+        epsilon = get_epsilon(epoch)
+        writer.add_scalar("Train/Epsilon", epsilon, epoch)
+        print(f"  [INFO] Epsilon: {epsilon:.3f}")
 
         current_tau_iou = get_tau_iou(epoch)
         train_env.set_tau_iou(current_tau_iou)
@@ -1400,7 +1403,6 @@ def train(args, device, train_ds, val_ds):
                 pbar.close()
                 break
 
-            epsilon = get_epsilon(global_step)
 
             policy_net.set_inference_mode()
             with torch.no_grad():
@@ -1463,15 +1465,15 @@ def train(args, device, train_ds, val_ds):
                 giou_active = gious[step_active_mask]
                 diou_active = dious[step_active_mask]
 
-                writer.add_scalar("Train/Step/IoU_mean", iou_active.mean().item(), global_step)
-                writer.add_scalar("Train/Step/IoU_std", iou_active.std(unbiased=False).item(), global_step)
-                writer.add_scalar("Train/Step/IoU_max", iou_active.max().item(), global_step)
-                writer.add_scalar("Train/Step/GIoU_mean", giou_active.mean().item(), global_step)
-                writer.add_scalar("Train/Step/GIoU_std", giou_active.std(unbiased=False).item(), global_step)
-                writer.add_scalar("Train/Step/GIoU_max", giou_active.max().item(), global_step)
-                writer.add_scalar("Train/Step/DIoU_mean", diou_active.mean().item(), global_step)
-                writer.add_scalar("Train/Step/DIoU_std", diou_active.std(unbiased=False).item(), global_step)
-                writer.add_scalar("Train/Step/DIoU_max", diou_active.max().item(), global_step)
+                writer.add_scalar("Train/Step/IoU_Mean", iou_active.mean().item(), global_step)
+                writer.add_scalar("Train/Step/IoU_Std", iou_active.std(unbiased=False).item(), global_step)
+                writer.add_scalar("Train/Step/IoU_Max", iou_active.max().item(), global_step)
+                writer.add_scalar("Train/Step/GIoU_Mean", giou_active.mean().item(), global_step)
+                writer.add_scalar("Train/Step/GIoU_Std", giou_active.std(unbiased=False).item(), global_step)
+                writer.add_scalar("Train/Step/GIoU_Max", giou_active.max().item(), global_step)
+                writer.add_scalar("Train/Step/DIoU_Mean", diou_active.mean().item(), global_step)
+                writer.add_scalar("Train/Step/DIoU_Std", diou_active.std(unbiased=False).item(), global_step)
+                writer.add_scalar("Train/Step/DIoU_Max", diou_active.max().item(), global_step)
 
                 writer.add_scalar("Train/Step/Epsilon", epsilon, global_step)
                 writer.add_scalar("Train/Step/Teacher_Prob", p_teacher, global_step)
@@ -1500,10 +1502,11 @@ def train(args, device, train_ds, val_ds):
             active_mask = active_mask & (~dones)
             obs = next_obs
             # Aggiornamento Q-network
+            gradient_updates_happened_this_epoch = False
             if memory.size > args.batch_size * 10:
                 for _ in range(args.gradient_steps):
                     if per_enabled:
-                        beta = get_per_beta(global_step, total_training_steps)
+                        beta = get_per_beta(epoch, args.n_epochs)
                         memory.set_beta(beta)
                         b_s, b_hist, b_extra, b_act, b_rew, b_ns, b_nhist, b_nextra, b_term, b_is_expert, \
                             per_idx, is_weights = memory.sample_per(args.batch_size)
@@ -1545,7 +1548,6 @@ def train(args, device, train_ds, val_ds):
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(policy_net.head.parameters(), max_norm=10.0)
                     optimizer.step()
-                    scheduler.step()
 
                     if per_enabled:
                         memory.update_priorities(per_idx, td_errors)
@@ -1555,6 +1557,7 @@ def train(args, device, train_ds, val_ds):
                             tp.data.mul_(1.0 - args.target_tau).add_(args.target_tau * p.data)
 
                     epoch_losses.append(loss.item())
+                gradient_updates_happened_this_epoch = True
 
                 writer.add_scalar("Train/Loss", loss.item(), global_step)
                 writer.add_scalar("Train/LR", scheduler.get_last_lr()[0], global_step)
@@ -1567,6 +1570,8 @@ def train(args, device, train_ds, val_ds):
             })
 
         # --- FINE EPOCA: gestione slot ancora attivi (timeout) ---
+        if gradient_updates_happened_this_epoch:
+            scheduler.step()
         if active_mask.any():
             last_boxes = train_env.boxes[active_mask]
             last_gt = train_env.gt_boxes[active_mask]
@@ -1625,33 +1630,33 @@ def train(args, device, train_ds, val_ds):
         max_best_diou = best_diou_all.max().item()
 
         # Logging delle metriche di epoca in TensorBoard (Training)
-        writer.add_scalar("Epoch/Train_Final_IoU_mean", mean_iou, epoch)
-        writer.add_scalar("Epoch/Train_Final_IoU_std", std_iou, epoch)
-        writer.add_scalar("Epoch/Train_Final_IoU_max", max_iou, epoch)
-        writer.add_scalar("Epoch/Train_Final_GIoU_mean", mean_giou, epoch)
-        writer.add_scalar("Epoch/Train_Final_GIoU_std", std_giou, epoch)
-        writer.add_scalar("Epoch/Train_Final_GIoU_max", max_giou, epoch)
-        writer.add_scalar("Epoch/Train_Final_DIoU_mean", mean_diou, epoch)
-        writer.add_scalar("Epoch/Train_Final_DIoU_std", std_diou, epoch)
-        writer.add_scalar("Epoch/Train_Final_DIoU_max", max_diou, epoch)
-        writer.add_scalar("Epoch/Train_Reward_mean", mean_reward, epoch)
-        writer.add_scalar("Epoch/Train_Reward_std", std_reward, epoch)
-        writer.add_scalar("Epoch/Train_Reward_max", max_reward, epoch)
-        writer.add_scalar("Epoch/Train_Steps_mean", mean_steps, epoch)
-        writer.add_scalar("Epoch/Train_Steps_std", std_steps, epoch)
-        writer.add_scalar("Epoch/Train_Steps_max", max_steps, epoch)
+        writer.add_scalar("Epoch/Train_Final_IoU_Mean", mean_iou, epoch)
+        writer.add_scalar("Epoch/Train_Final_IoU_Std", std_iou, epoch)
+        writer.add_scalar("Epoch/Train_Final_IoU_Max", max_iou, epoch)
+        writer.add_scalar("Epoch/Train_Final_GIoU_Mean", mean_giou, epoch)
+        writer.add_scalar("Epoch/Train_Final_GIoU_Std", std_giou, epoch)
+        writer.add_scalar("Epoch/Train_Final_GIoU_Max", max_giou, epoch)
+        writer.add_scalar("Epoch/Train_Final_DIoU_Mean", mean_diou, epoch)
+        writer.add_scalar("Epoch/Train_Final_DIoU_Std", std_diou, epoch)
+        writer.add_scalar("Epoch/Train_Final_DIoU_Max", max_diou, epoch)
+        writer.add_scalar("Epoch/Train_Reward_Mean", mean_reward, epoch)
+        writer.add_scalar("Epoch/Train_Reward_Std", std_reward, epoch)
+        writer.add_scalar("Epoch/Train_Reward_Max", max_reward, epoch)
+        writer.add_scalar("Epoch/Train_Steps_Mean", mean_steps, epoch)
+        writer.add_scalar("Epoch/Train_Steps_Std", std_steps, epoch)
+        writer.add_scalar("Epoch/Train_Steps_Max", max_steps, epoch)
         writer.add_scalar("Epoch/Train_Success_Rate", success_rate, epoch)
 
         # Best metriche (training)
-        writer.add_scalar("Epoch/Train_Best_IoU_mean", mean_best_iou, epoch)
-        writer.add_scalar("Epoch/Train_Best_IoU_std", std_best_iou, epoch)
-        writer.add_scalar("Epoch/Train_Best_IoU_max", max_best_iou, epoch)
-        writer.add_scalar("Epoch/Train_Best_GIoU_mean", mean_best_giou, epoch)
-        writer.add_scalar("Epoch/Train_Best_GIoU_std", std_best_giou, epoch)
-        writer.add_scalar("Epoch/Train_Best_GIoU_max", max_best_giou, epoch)
-        writer.add_scalar("Epoch/Train_Best_DIoU_mean", mean_best_diou, epoch)
-        writer.add_scalar("Epoch/Train_Best_DIoU_std", std_best_diou, epoch)
-        writer.add_scalar("Epoch/Train_Best_DIoU_max", max_best_diou, epoch)
+        writer.add_scalar("Epoch/Train_Best_IoU_Mean", mean_best_iou, epoch)
+        writer.add_scalar("Epoch/Train_Best_IoU_Std", std_best_iou, epoch)
+        writer.add_scalar("Epoch/Train_Best_IoU_Max", max_best_iou, epoch)
+        writer.add_scalar("Epoch/Train_Best_GIoU_Mean", mean_best_giou, epoch)
+        writer.add_scalar("Epoch/Train_Best_GIoU_Std", std_best_giou, epoch)
+        writer.add_scalar("Epoch/Train_Best_GIoU_Max", max_best_giou, epoch)
+        writer.add_scalar("Epoch/Train_Best_DIoU_Mean", mean_best_diou, epoch)
+        writer.add_scalar("Epoch/Train_Best_DIoU_Std", std_best_diou, epoch)
+        writer.add_scalar("Epoch/Train_Best_DIoU_Max", max_best_diou, epoch)
 
         epoch_avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
         writer.add_scalar("Epoch/Train_Avg_Loss", epoch_avg_loss, epoch)
@@ -1675,7 +1680,7 @@ def train(args, device, train_ds, val_ds):
         val_indices = next(batch_generator_val)   # ottieni il prossimo batch
 
         val_metrics = validate(
-            val_env, policy_net, val_indices, device, writer, global_step, epoch + 1, args.n_epochs
+            val_env, policy_net, val_indices, device, writer, epoch + 1, args.n_epochs
         )
 
         # Estraggo le metriche principali
@@ -1689,7 +1694,7 @@ def train(args, device, train_ds, val_ds):
         val_mean_step = val_metrics['mean_step']
 
         # Log delle metriche principali (alcune già loggate dentro validate, ma posso aggiungere)
-        writer.add_scalar("Epoch/Val_Final_IoU", val_final_iou, epoch)
+        writer.add_scalar("Epoch/Val_Final_IoU_Mean", val_final_iou, epoch)
         writer.add_scalar("Epoch/Val_Final_Best_IoU", val_final_best_iou, epoch)
         writer.add_scalar("Epoch/Val_Success_Rate", val_success_rate, epoch)
 
@@ -1797,8 +1802,7 @@ def run_test(args, device, test_ds):
         with torch.no_grad():
             for _ in range(MAX_STEPS_PER_EPISODE):
                 q_values = policy_net(obs["rois"], obs["histories"], obs["extra"], global_features=global_features)
-                q_values_masked = q_values.clone()
-                actions = q_values_masked.argmax(dim=1)
+                actions = q_values.argmax(dim=1)
                 is_trigger = (actions[0].item() == 8)
 
                 # Estrai frame e disegna bounding box (come prima)
@@ -2027,7 +2031,7 @@ if __name__ == "__main__":
     parser.add_argument("--use-tau-curriculum", action="store_true", default=True)
     parser.add_argument("--no-tau-curriculum", dest="use_tau_curriculum", action="store_false")
     parser.add_argument("--tau-iou-start", type=float, default=0.4)
-    parser.add_argument("--epsilon-decay-steps", type=int, default=None)
+    parser.add_argument("--epsilon-decay-epochs", type=int, default=None)
     parser.add_argument("--use-dqfd-margin", action="store_true", default=True)
     parser.add_argument("--no-dqfd-margin", dest="use_dqfd_margin", action="store_false")
     parser.add_argument("--dqfd-margin", type=float, default=0.8)
