@@ -1797,10 +1797,7 @@ def run_test(args, device, test_ds):
         with torch.no_grad():
             for _ in range(MAX_STEPS_PER_EPISODE):
                 q_values = policy_net(obs["rois"], obs["histories"], obs["extra"], global_features=global_features)
-                shrink_allowed = env.get_shrink_allowed_mask()
                 q_values_masked = q_values.clone()
-                q_values_masked[~shrink_allowed, 4] = -1e9
-                q_values_masked[~shrink_allowed, 5] = -1e9
                 actions = q_values_masked.argmax(dim=1)
                 is_trigger = (actions[0].item() == 8)
 
