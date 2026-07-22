@@ -79,6 +79,63 @@ N_STEP = 3
 # Reward scaling
 REWARD_SCALING_EPS = 1e-6
 
+
+# POSSIBILMENTE DA RIMUOVERE
+def compute_giou_tensor(b1, b2):
+    # b1, b2: [N, 4] (x1, y1, x2, y2)
+    xi1 = torch.max(b1[:, 0], b2[:, 0])
+    yi1 = torch.max(b1[:, 1], b2[:, 1])
+    xi2 = torch.min(b1[:, 2], b2[:, 2])
+    yi2 = torch.min(b1[:, 3], b2[:, 3])
+    inter_area = torch.clamp(xi2 - xi1, min=0) * torch.clamp(yi2 - yi1, min=0)
+    area1 = torch.clamp(b1[:, 2] - b1[:, 0], min=0) * torch.clamp(b1[:, 3] - b1[:, 1], min=0)
+    area2 = torch.clamp(b2[:, 2] - b2[:, 0], min=0) * torch.clamp(b2[:, 3] - b2[:, 1], min=0)
+    union_area = area1 + area2 - inter_area
+    iou = inter_area / torch.clamp(union_area, min=1e-6)
+    cx1 = torch.min(b1[:, 0], b2[:, 0])
+    cy1 = torch.min(b1[:, 1], b2[:, 1])
+    cx2 = torch.max(b1[:, 2], b2[:, 2])
+    cy2 = torch.max(b1[:, 3], b2[:, 3])
+    enclose_area = torch.clamp(cx2 - cx1, min=0) * torch.clamp(cy2 - cy1, min=0)
+    return iou - (enclose_area - union_area) / torch.clamp(enclose_area, min=1e-6)
+
+def compute_diou_tensor(b1, b2):
+    # b1, b2: [N, 4] (x1, y1, x2, y2)
+    # Center points
+    c1_x = (b1[:, 0] + b1[:, 2]) / 2
+    c1_y = (b1[:, 1] + b1[:, 3]) / 2
+    c2_x = (b2[:, 0] + b2[:, 2]) / 2
+    c2_y = (b2[:, 1] + b2[:, 3]) / 2
+    
+    # Euclidean distance squared between centers
+    rho2 = (c1_x - c2_x)**2 + (c1_y - c2_y)**2
+    
+    # Diagonal length squared of the smallest enclosing box
+    # smallest enclosing box: min x1, min y1, max x2, max y2
+    x1_min = torch.min(b1[:, 0], b2[:, 0])
+    y1_min = torch.min(b1[:, 1], b2[:, 1])
+    x2_max = torch.max(b1[:, 2], b2[:, 2])
+    y2_max = torch.max(b1[:, 3], b2[:, 3])
+    c2 = (x2_max - x1_min)**2 + (y2_max - y1_min)**2
+    
+    # IoU
+    xi1 = torch.max(b1[:, 0], b2[:, 0])
+    yi1 = torch.max(b1[:, 1], b2[:, 1])
+    xi2 = torch.min(b1[:, 2], b2[:, 2])
+    yi2 = torch.min(b1[:, 3], b2[:, 3])
+    inter = torch.clamp(xi2 - xi1, min=0) * torch.clamp(yi2 - yi1, min=0)
+    area1 = torch.clamp(b1[:, 2] - b1[:, 0], min=0) * torch.clamp(b1[:, 3] - b1[:, 1], min=0)
+    area2 = torch.clamp(b2[:, 2] - b2[:, 0], min=0) * torch.clamp(b2[:, 3] - b2[:, 1], min=0)
+    union = area1 + area2 - inter
+    iou = inter / torch.clamp(union, min=1e-6)
+    
+    diou = iou - (rho2 / torch.clamp(c2, min=1e-6))
+    return diou
+
+
+
+
+
 def compute_iou_tensor(b1, b2):
     # Calcolo il massimo delle coordinate x e y iniziali tra le due box (se c'è sovrapposiziona inizierà da dove entrambe le box esistono)
     xi1 = torch.max(b1[:, 0], b2[:, 0])
@@ -221,6 +278,8 @@ class BatchedActiveLocalizationEnv:
         
         # Contiene le variabili precedenti
         self.previous_ious = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        self.previous_gious = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        self.previous_dious = torch.zeros(batch_size, dtype=torch.float32, device=device)
         self.previous_cious = torch.zeros(batch_size, dtype=torch.float32, device=device)
         self.previous_dists = torch.zeros(batch_size, dtype=torch.float32, device=device)
         
@@ -286,6 +345,8 @@ class BatchedActiveLocalizationEnv:
         # Imposto le metriche da utilizzare nel codice
         self.previous_dists = torch.norm(curr_centers - gt_centers, dim=1)
         self.previous_ious = compute_iou_tensor(self.boxes, self.gt_boxes)
+        self.previous_gious = compute_giou_tensor(self.boxes, self.gt_boxes)
+        self.previous_dious = compute_diou_tensor(self.boxes, self.gt_boxes)
         self.previous_cious = compute_ciou_tensor(self.boxes, self.gt_boxes)
         self.best_ious = self.previous_ious.clone()
         self.best_boxes = self.boxes.clone()
@@ -419,6 +480,8 @@ class BatchedActiveLocalizationEnv:
 
         # Calcolo metriche sulla nuova box
         new_ious = compute_iou_tensor(self.boxes, self.gt_boxes)
+        new_gious = compute_giou_tensor(self.boxes, self.gt_boxes)
+        new_dious = compute_diou_tensor(self.boxes, self.gt_boxes)
         new_cious = compute_ciou_tensor(self.boxes, self.gt_boxes)
         
         # Calcolo la variazione di CIoU e assegno reward in base ad essa
@@ -451,9 +514,11 @@ class BatchedActiveLocalizationEnv:
 
         # Aggiorno i valori
         self.previous_ious = new_ious
+        self.previous_gious = new_gious
+        self.previous_dious = new_dious
         self.previous_cious = new_cious
         
-        return self._get_obs(), rewards, (terminated | truncated), new_ious, new_cious
+        return self._get_obs(), rewards, (terminated | truncated), new_ious, new_gious, new_dious
 
     def _simulate_move_boxes(self, boxes):
         # Ottengo il numero delle box
@@ -976,11 +1041,11 @@ class PolicyNetwork(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. VALIDAZIONE (solo metriche finali)
 # ─────────────────────────────────────────────────────────────────────────────
-def validate(env, policy_net, valid_indices, device, writer, epoch, n_epochs, tag="Validation"):
+def validate(env, policy_net, val_indices, device, writer, epoch, n_epochs, tag="Validation"):
     policy_net.eval()
     policy_net.set_inference_mode()
 
-    obs = env.reset_all(valid_indices)
+    obs = env.reset_all(val_indices)
     with torch.no_grad():
         global_features = policy_net.extract_global_features(obs["images"])
     num_envs = env.num_envs
@@ -988,9 +1053,11 @@ def validate(env, policy_net, valid_indices, device, writer, epoch, n_epochs, ta
     step_counts = torch.zeros(num_envs, device=device)   # conteggio passi per episodio (per media)
     active_mask = torch.ones(num_envs, dtype=torch.bool, device=device)
     last_iou_per_slot = torch.zeros(num_envs, device=device)
-    last_ciou_per_slot = torch.zeros(num_envs, device=device)
+    last_diou_per_slot = torch.zeros(num_envs, device=device)
+    last_giou_per_slot = torch.zeros(num_envs, device=device)
     final_ious = torch.zeros(num_envs, device=device)
-    final_cious = torch.zeros(num_envs, device=device)
+    final_gious = torch.zeros(num_envs, device=device)
+    final_dious = torch.zeros(num_envs, device=device)
 
     with torch.no_grad():
         for _ in range(MAX_STEPS_PER_EPISODE):
@@ -999,33 +1066,39 @@ def validate(env, policy_net, valid_indices, device, writer, epoch, n_epochs, ta
             q_values = policy_net(obs["rois"], obs["histories"], obs["extra"], global_features=global_features)
             actions = q_values.argmax(dim=1)
             step_counts[active_mask] += 1
-            next_obs, rewards, dones, ious, cious = env.step(actions)
+            next_obs, rewards, dones, ious, gious, dious = env.step(actions)
             
             reward_sums[active_mask] += rewards[active_mask]
 
             newly_done = active_mask & dones
             final_ious[newly_done]  = ious[newly_done]
-            final_cious[newly_done] = cious[newly_done]
+            final_gious[newly_done] = gious[newly_done]
+            final_dious[newly_done] = dious[newly_done]
 
             active_mask = active_mask & (~dones)
             last_iou_per_slot  = torch.where(active_mask, ious, last_iou_per_slot)
-            last_ciou_per_slot = torch.where(active_mask, cious, last_ciou_per_slot)
+            last_diou_per_slot = torch.where(active_mask, dious, last_diou_per_slot)
+            last_giou_per_slot = torch.where(active_mask, gious, last_giou_per_slot)
             obs = next_obs
 
     if active_mask.any():
         final_ious[active_mask] = last_iou_per_slot[active_mask]
-        final_cious[active_mask] = last_ciou_per_slot[active_mask]
+        final_dious[active_mask] = last_diou_per_slot[active_mask]
+        final_gious[active_mask] = last_giou_per_slot[active_mask]
 
     final_avg_iou = final_ious.mean().item()
-    final_avg_ciou = final_cious.mean().item()
+    final_avg_diou = final_dious.mean().item()
+    final_avg_giou = final_gious.mean().item()
     mean_reward = reward_sums.mean().item()
     mean_step = step_counts.mean().item()
     final_best_iou = final_ious.max().item()
-    final_best_ciou = final_cious.max().item()
+    final_best_diou = final_dious.max().item()
+    final_best_giou = final_gious.max().item()
     max_reward = reward_sums.max().item()
     max_step = step_counts.max().item()
     final_std_iou = final_ious.std(unbiased=False).item()
-    final_std_ciou = final_cious.std(unbiased=False).item()
+    final_std_diou = final_dious.std(unbiased=False).item()
+    final_std_giou = final_gious.std(unbiased=False).item()
     std_reward = reward_sums.std(unbiased=False).item()
     std_step = step_counts.std(unbiased=False).item()
     success_rate = (final_ious >= TAU_IOU).float().mean().item()
@@ -1036,9 +1109,12 @@ def validate(env, policy_net, valid_indices, device, writer, epoch, n_epochs, ta
     writer.add_scalar(f"{tag}/Final_Avg_IoU", final_avg_iou, epoch)
     writer.add_scalar(f"{tag}/Final_Std_IoU", final_std_iou, epoch)
     writer.add_scalar(f"{tag}/Final_Best_IoU", final_best_iou, epoch)
-    writer.add_scalar(f"{tag}/Final_Avg_CIoU", final_avg_ciou, epoch)
-    writer.add_scalar(f"{tag}/Final_Std_CIoU", final_std_ciou, epoch)
-    writer.add_scalar(f"{tag}/Final_Best_CIoU", final_best_ciou, epoch)
+    writer.add_scalar(f"{tag}/Final_Avg_DIoU", final_avg_diou, epoch)
+    writer.add_scalar(f"{tag}/Final_Std_DIoU", final_std_diou, epoch)
+    writer.add_scalar(f"{tag}/Final_Best_DIoU", final_best_diou, epoch)
+    writer.add_scalar(f"{tag}/Final_Avg_GIoU", final_avg_giou, epoch)
+    writer.add_scalar(f"{tag}/Final_Std_GIoU", final_std_giou, epoch)
+    writer.add_scalar(f"{tag}/Final_Best_GIoU", final_best_giou, epoch)
     writer.add_scalar(f"{tag}/Success_Rate", success_rate, epoch)
     
     writer.add_scalar(f"{tag}/Reward_Mean", mean_reward, epoch)
@@ -1055,9 +1131,12 @@ def validate(env, policy_net, valid_indices, device, writer, epoch, n_epochs, ta
         'avg_iou': final_avg_iou,
         'std_iou': final_std_iou,
         'best_iou': final_best_iou,
-        'avg_ciou': final_avg_ciou,
-        'std_ciou': final_std_ciou,
-        'best_ciou': final_best_ciou,
+        'avg_diou': final_avg_diou,
+        'std_diou': final_std_diou,
+        'best_diou': final_best_diou,
+        'avg_giou': final_avg_giou,
+        'std_giou': final_std_giou,
+        'best_giou': final_best_giou,
         'mean_reward': mean_reward,
         'std_reward': std_reward,
         'max_reward': max_reward,
@@ -1142,7 +1221,7 @@ def cyclic_batch_indices(dataset_size, batch_size, shuffle=True):
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. TRAINING LOOP (semplificato)
 # ─────────────────────────────────────────────────────────────────────────────
-def train(args, device, train_ds, valid_ds):
+def train(args, device, train_ds, val_ds):
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = os.path.join(args.output_root, "logs", timestamp)
@@ -1155,7 +1234,7 @@ def train(args, device, train_ds, valid_ds):
     print(f"[INFO] Checkpoint directory: {checkpoint_dir}")
 
     train_env = BatchedActiveLocalizationEnv(train_ds, batch_size=args.batch_size, device=device)
-    valid_env = BatchedActiveLocalizationEnv(valid_ds, batch_size=args.batch_size, device=device)
+    val_env = BatchedActiveLocalizationEnv(val_ds, batch_size=args.batch_size, device=device)
 
     print(f"[INFO] Creazione PolicyNetwork (backbone ResNet18 congelato) + Target Network...")
     policy_net = PolicyNetwork(HISTORY_LENGTH * N_ACTIONS, N_ACTIONS,
@@ -1272,7 +1351,7 @@ def train(args, device, train_ds, valid_ds):
     print("=" * 80)
     
     batch_generator = cyclic_batch_indices(len(train_ds), args.batch_size, shuffle=True)
-    batch_generator_val = cyclic_batch_indices(len(valid_ds), args.batch_size, shuffle=True)
+    batch_generator_val = cyclic_batch_indices(len(val_ds), args.batch_size, shuffle=True)
     for epoch in range(start_epoch, args.n_epochs):
         
         reward_sums = torch.zeros(args.batch_size, device=device)   # reward cumulativa per slot
@@ -1294,7 +1373,8 @@ def train(args, device, train_ds, valid_ds):
 
         # Accumulatori per metriche di epoca
         epoch_final_ious = []
-        epoch_final_cious = []
+        epoch_final_gious = []
+        epoch_final_dious = []
         epoch_rewards = []
         epoch_steps = []
         epoch_losses = []
@@ -1345,7 +1425,7 @@ def train(args, device, train_ds, valid_ds):
 
                 is_expert_step = teacher_mask.float()
 
-            next_obs, rewards, dones, ious, cious = train_env.step(actions)
+            next_obs, rewards, dones, ious, gious, dious = train_env.step(actions)
             # Aggiorna accumulatori per gli slot attivi
             rewards = torch.clamp(rewards, -REWARD_CLIP, REWARD_CLIP)
             reward_sums[active_mask] += rewards[active_mask]
@@ -1382,21 +1462,40 @@ def train(args, device, train_ds, valid_ds):
 
             if n_active > 0:
                 iou_active = ious[step_active_mask]
+                giou_active = gious[step_active_mask]
+                diou_active = dious[step_active_mask]
+
+                writer.add_scalar("Train/Step/IoU_Mean", iou_active.mean().item(), global_step)
+                writer.add_scalar("Train/Step/IoU_Std", iou_active.std(unbiased=False).item(), global_step)
+                writer.add_scalar("Train/Step/IoU_Max", iou_active.max().item(), global_step)
+                writer.add_scalar("Train/Step/GIoU_Mean", giou_active.mean().item(), global_step)
+                writer.add_scalar("Train/Step/GIoU_Std", giou_active.std(unbiased=False).item(), global_step)
+                writer.add_scalar("Train/Step/GIoU_Max", giou_active.max().item(), global_step)
+                writer.add_scalar("Train/Step/DIoU_Mean", diou_active.mean().item(), global_step)
+                writer.add_scalar("Train/Step/DIoU_Std", diou_active.std(unbiased=False).item(), global_step)
+                writer.add_scalar("Train/Step/DIoU_Max", diou_active.max().item(), global_step)
+
+                writer.add_scalar("Train/Step/Epsilon", epsilon, global_step)
+                writer.add_scalar("Train/Step/Teacher_Prob", p_teacher, global_step)
+                writer.add_scalar("Train/Step/Reward_Std", reward_scaler.std().item(), global_step)
 
                 current_step_iou = iou_active.mean().item()
                 epoch_step_ious.append(current_step_iou)
+                writer.add_scalar("Train/Step_IoU", current_step_iou, global_step)
 
             last_iou_per_slot = torch.where(step_active_mask, ious.detach(), last_iou_per_slot)
             newly_done = step_active_mask & dones
             if newly_done.any():
                 done_indices = torch.where(newly_done)[0]
                 final_iou_new = ious[done_indices]
-                final_ciou_new = cious[done_indices]
+                final_giou_new = gious[done_indices]
+                final_diou_new = dious[done_indices]
                 final_reward_new = reward_sums[done_indices]
                 final_step_new = step_counts[done_indices]
                 
                 epoch_final_ious.extend(final_iou_new.cpu().tolist())
-                epoch_final_cious.extend(final_ciou_new.cpu().tolist())
+                epoch_final_gious.extend(final_giou_new.cpu().tolist())
+                epoch_final_dious.extend(final_diou_new.cpu().tolist())
                 epoch_rewards.extend(final_reward_new.cpu().tolist())
                 epoch_steps.extend(final_step_new.cpu().tolist())
 
@@ -1477,12 +1576,14 @@ def train(args, device, train_ds, valid_ds):
             last_boxes = train_env.boxes[active_mask]
             last_gt = train_env.gt_boxes[active_mask]
             last_iou = compute_iou_tensor(last_boxes, last_gt)
-            last_ciou = compute_ciou_tensor(last_boxes, last_gt)
+            last_giou = compute_giou_tensor(last_boxes, last_gt)
+            last_diou = compute_diou_tensor(last_boxes, last_gt)
             last_reward = reward_sums[active_mask]
             last_step = step_counts[active_mask]
 
             epoch_final_ious.extend(last_iou.cpu().tolist())
-            epoch_final_cious.extend(last_ciou.cpu().tolist())
+            epoch_final_gious.extend(last_giou.cpu().tolist())
+            epoch_final_dious.extend(last_diou.cpu().tolist())
             epoch_rewards.extend(last_reward.cpu().tolist())
             epoch_steps.extend(last_step.cpu().tolist())
 
@@ -1491,9 +1592,12 @@ def train(args, device, train_ds, valid_ds):
             mean_iou = np.mean(epoch_final_ious)
             std_iou = np.std(epoch_final_ious)
             max_iou = np.max(epoch_final_ious)
-            mean_ciou = np.mean(epoch_final_cious)
-            std_ciou = np.std(epoch_final_cious)
-            max_ciou = np.max(epoch_final_cious)
+            mean_giou = np.mean(epoch_final_gious)
+            std_giou = np.std(epoch_final_gious)
+            max_giou = np.max(epoch_final_gious)
+            mean_diou = np.mean(epoch_final_dious)
+            std_diou = np.std(epoch_final_dious)
+            max_diou = np.max(epoch_final_dious)
             mean_reward = np.mean(epoch_rewards)
             std_reward = np.std(epoch_rewards)
             max_reward = np.max(epoch_rewards)
@@ -1503,7 +1607,8 @@ def train(args, device, train_ds, valid_ds):
             success_rate = (np.array(epoch_final_ious) >= current_tau_iou).mean()
         else:
             mean_iou = std_iou = max_iou = float('nan')
-            mean_ciou = std_ciou = max_ciou = float('nan')
+            mean_giou = std_giou = max_giou = float('nan')
+            mean_diou = std_diou = max_diou = float('nan')
             mean_reward = std_reward = max_reward = float('nan')
             mean_steps = std_steps = max_steps = float('nan')
             success_rate = 0.0
@@ -1511,22 +1616,29 @@ def train(args, device, train_ds, valid_ds):
         # Best metriche (da env.best_ious e env.best_boxes)
         best_iou_all = train_env.best_ious  # [batch_size]
         best_boxes_all = train_env.best_boxes
-        best_ciou_all = compute_ciou_tensor(best_boxes_all, train_env.gt_boxes)
+        best_giou_all = compute_giou_tensor(best_boxes_all, train_env.gt_boxes)
+        best_diou_all = compute_diou_tensor(best_boxes_all, train_env.gt_boxes)
         # Calcolo solo sugli slot che hanno almeno un episodio (tutti)
         mean_best_iou = best_iou_all.mean().item()
         std_best_iou = best_iou_all.std().item()
         max_best_iou = best_iou_all.max().item()
-        mean_best_ciou = best_ciou_all.mean().item()
-        std_best_ciou = best_ciou_all.std().item()
-        max_best_ciou = best_ciou_all.max().item()
+        mean_best_giou = best_giou_all.mean().item()
+        std_best_giou = best_giou_all.std().item()
+        max_best_giou = best_giou_all.max().item()
+        mean_best_diou = best_diou_all.mean().item()
+        std_best_diou = best_diou_all.std().item()
+        max_best_diou = best_diou_all.max().item()
 
         # Logging delle metriche di epoca in TensorBoard (Training)
         writer.add_scalar("Epoch/Train_Final_IoU_Mean", mean_iou, epoch)
         writer.add_scalar("Epoch/Train_Final_IoU_Std", std_iou, epoch)
         writer.add_scalar("Epoch/Train_Final_IoU_Max", max_iou, epoch)
-        writer.add_scalar("Epoch/Train_Final_CIoU_Mean", mean_ciou, epoch)
-        writer.add_scalar("Epoch/Train_Final_CIoU_Std", std_ciou, epoch)
-        writer.add_scalar("Epoch/Train_Final_CIoU_Max", max_ciou, epoch)
+        writer.add_scalar("Epoch/Train_Final_GIoU_Mean", mean_giou, epoch)
+        writer.add_scalar("Epoch/Train_Final_GIoU_Std", std_giou, epoch)
+        writer.add_scalar("Epoch/Train_Final_GIoU_Max", max_giou, epoch)
+        writer.add_scalar("Epoch/Train_Final_DIoU_Mean", mean_diou, epoch)
+        writer.add_scalar("Epoch/Train_Final_DIoU_Std", std_diou, epoch)
+        writer.add_scalar("Epoch/Train_Final_DIoU_Max", max_diou, epoch)
         writer.add_scalar("Epoch/Train_Reward_Mean", mean_reward, epoch)
         writer.add_scalar("Epoch/Train_Reward_Std", std_reward, epoch)
         writer.add_scalar("Epoch/Train_Reward_Max", max_reward, epoch)
@@ -1539,9 +1651,12 @@ def train(args, device, train_ds, valid_ds):
         writer.add_scalar("Epoch/Train_Best_IoU_Mean", mean_best_iou, epoch)
         writer.add_scalar("Epoch/Train_Best_IoU_Std", std_best_iou, epoch)
         writer.add_scalar("Epoch/Train_Best_IoU_Max", max_best_iou, epoch)
-        writer.add_scalar("Epoch/Train_Best_CIoU_Mean", mean_best_ciou, epoch)
-        writer.add_scalar("Epoch/Train_Best_CIoU_Std", std_best_ciou, epoch)
-        writer.add_scalar("Epoch/Train_Best_CIoU_Max", max_best_ciou, epoch)
+        writer.add_scalar("Epoch/Train_Best_GIoU_Mean", mean_best_giou, epoch)
+        writer.add_scalar("Epoch/Train_Best_GIoU_Std", std_best_giou, epoch)
+        writer.add_scalar("Epoch/Train_Best_GIoU_Max", max_best_giou, epoch)
+        writer.add_scalar("Epoch/Train_Best_DIoU_Mean", mean_best_diou, epoch)
+        writer.add_scalar("Epoch/Train_Best_DIoU_Std", std_best_diou, epoch)
+        writer.add_scalar("Epoch/Train_Best_DIoU_Max", max_best_diou, epoch)
 
         epoch_avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
         writer.add_scalar("Epoch/Train_Avg_Loss", epoch_avg_loss, epoch)
@@ -1549,7 +1664,8 @@ def train(args, device, train_ds, valid_ds):
         # Stampa a schermo
         print(f"[Epoch {epoch+1}] Train Summary:")
         print(f"  Final IoU  : {mean_iou:.4f} ± {std_iou:.4f} (max {max_iou:.4f})")
-        print(f"  Final Ciou : {mean_ciou:.4f} ± {std_ciou:.4f} (max {max_ciou:.4f})")
+        print(f"  Final GIoU : {mean_giou:.4f} ± {std_giou:.4f} (max {max_giou:.4f})")
+        print(f"  Final DIoU : {mean_diou:.4f} ± {std_diou:.4f} (max {max_diou:.4f})")
         print(f"  Best IoU   : {mean_best_iou:.4f} ± {std_best_iou:.4f} (max {max_best_iou:.4f})")
         print(f"  Reward     : {mean_reward:.2f} ± {std_reward:.2f} (max {max_reward:.2f})")
         print(f"  Steps      : {mean_steps:.1f} ± {std_steps:.1f} (max {max_steps})")
@@ -1558,28 +1674,29 @@ def train(args, device, train_ds, valid_ds):
 
         # --- VALIDAZIONE ---
         print(f"\n[Epoch {epoch+1}] Validazione in corso...")
-        #valid_indices = np.random.choice(len(valid_ds), size=min(args.batch_size, len(valid_ds)), replace=False)
-        #valid_indices = np.pad(valid_indices, (0, args.batch_size - len(valid_indices)), 'wrap')
+       # val_indices = np.random.choice(len(val_ds), size=min(args.batch_size, len(val_ds)), replace=False)
+        #val_indices = np.pad(val_indices, (0, args.batch_size - len(val_indices)), 'wrap')
         
-        valid_indices = next(batch_generator_val)   # ottieni il prossimo batch
+        val_indices = next(batch_generator_val)   # ottieni il prossimo batch
 
-        valid_metrics = validate(
-            valid_env, policy_net, valid_indices, device, writer, epoch + 1, args.n_epochs
+        val_metrics = validate(
+            val_env, policy_net, val_indices, device, writer, epoch + 1, args.n_epochs
         )
 
         # Estraggo le metriche principali
-        valid_final_iou = valid_metrics['avg_iou']
-        valid_final_best_iou = valid_metrics['best_iou']
-        valid_success_rate = valid_metrics['success_rate']
+        val_final_iou = val_metrics['avg_iou']
+        val_final_best_iou = val_metrics['best_iou']
+        val_success_rate = val_metrics['success_rate']
         # (opzionale: posso estrarre anche le altre, ad es. per il checkpoint)
-        valid_avg_ciou = valid_metrics['avg_ciou']
-        valid_mean_reward = valid_metrics['mean_reward']
-        valid_mean_step = valid_metrics['mean_step']
+        val_avg_giou = val_metrics['avg_giou']
+        val_avg_diou = val_metrics['avg_diou']
+        val_mean_reward = val_metrics['mean_reward']
+        val_mean_step = val_metrics['mean_step']
 
         # Log delle metriche principali (alcune già loggate dentro validate, ma posso aggiungere)
-        writer.add_scalar("Epoch/Valid_Final_IoU_Mean", valid_final_iou, epoch)
-        writer.add_scalar("Epoch/Valid_Final_Best_IoU", valid_final_best_iou, epoch)
-        writer.add_scalar("Epoch/Valid_Success_Rate", valid_success_rate, epoch)
+        writer.add_scalar("Epoch/Val_Final_IoU_Mean", val_final_iou, epoch)
+        writer.add_scalar("Epoch/Val_Final_Best_IoU", val_final_best_iou, epoch)
+        writer.add_scalar("Epoch/Val_Success_Rate", val_success_rate, epoch)
 
         # Checkpoint (incluse le nuove metriche)
         checkpoint = {
@@ -1588,13 +1705,14 @@ def train(args, device, train_ds, valid_ds):
             'policy_net_state_dict': policy_net.state_dict(),
             'target_net_state_dict': target_net.state_dict(),
             'train_loss': epoch_avg_loss,
-            'valid_final_iou': valid_final_iou,
-            'valid_final_best_iou': valid_final_best_iou,
-            'valid_success_rate': valid_success_rate,
-            'valid_avg_ciou': valid_avg_ciou,
-            'valid_mean_reward': valid_mean_reward,
-            'valid_mean_step': valid_mean_step,
-            'best_iou': max(best_iou, valid_final_iou),
+            'val_final_iou': val_final_iou,
+            'val_final_best_iou': val_final_best_iou,
+            'val_success_rate': val_success_rate,
+            'val_avg_giou': val_avg_giou,
+            'val_avg_diou': val_avg_diou,
+            'val_mean_reward': val_mean_reward,
+            'val_mean_step': val_mean_step,
+            'best_iou': max(best_iou, val_final_iou),
             'args': args,
             'reward_scaler_state': reward_scaler.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -1606,8 +1724,8 @@ def train(args, device, train_ds, valid_ds):
         torch.save(checkpoint, epoch_checkpoint_path)
         print(f"  [✓] Checkpoint salvato: {epoch_checkpoint_path}")
 
-        if valid_final_iou > best_iou:
-            best_iou = valid_final_iou
+        if val_final_iou > best_iou:
+            best_iou = val_final_iou
             best_checkpoint_path = os.path.join(checkpoint_dir, "best_checkpoint.pt")
             torch.save(checkpoint, best_checkpoint_path)
             print(f"  [✓] Best checkpoint salvato (IoU best-seen: {best_iou:.4f})")
@@ -1657,9 +1775,11 @@ def run_test(args, device, test_ds):
 
     # Liste per metriche aggregate
     final_ious_all = []
-    final_cious_all = []
+    final_gious_all = []
+    final_dious_all = []
     best_ious_all = []
-    best_cious_all = []
+    best_gious_all = []
+    best_dious_all = []
     total_rewards_all = []
     steps_all = []
     triggered_all = []
@@ -1670,9 +1790,11 @@ def run_test(args, device, test_ds):
             global_features = policy_net.extract_global_features(obs["images"])
         frames = []
         final_iou = 0.0
-        final_ciou = 0.0
+        final_giou = 0.0
+        final_diou = 0.0
         best_iou = -1.0
-        best_ciou = -1.0
+        best_giou = -1.0
+        best_diou = -1.0
         total_reward = 0.0
         steps = 0
         triggered = False
@@ -1695,18 +1817,20 @@ def run_test(args, device, test_ds):
                 frame = cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
 
                 # Step dell'ambiente (ora restituisce 6 valori)
-                next_obs, rewards, dones, ious, cious = env.step(actions)
+                next_obs, rewards, dones, ious, gious, dious = env.step(actions)
 
                 # Aggiorna metriche correnti
                 final_iou = ious[0].item()
-                final_ciou = cious[0].item()
+                final_giou = gious[0].item()
+                final_diou = dious[0].item()
                 total_reward += rewards[0].item()
                 steps += 1
 
                 # Aggiorna best values
                 if final_iou > best_iou:
                     best_iou = final_iou
-                    best_ciou = final_ciou
+                    best_giou = final_giou
+                    best_diou = final_diou
 
                 cv2.putText(frame, f"IoU: {final_iou:.3f}", (5, 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
@@ -1722,9 +1846,11 @@ def run_test(args, device, test_ds):
 
         # Fine episodio: registra metriche
         final_ious_all.append(final_iou)
-        final_cious_all.append(final_ciou)
+        final_gious_all.append(final_giou)
+        final_dious_all.append(final_diou)
         best_ious_all.append(best_iou)
-        best_cious_all.append(best_ciou)
+        best_gious_all.append(best_giou)
+        best_dious_all.append(best_diou)
         total_rewards_all.append(total_reward)
         steps_all.append(steps)
         triggered_all.append(triggered)
@@ -1762,16 +1888,22 @@ def run_test(args, device, test_ds):
     mean_final_iou = np.mean(final_ious_all)
     std_final_iou = np.std(final_ious_all)
     max_final_iou = np.max(final_ious_all)
-    mean_final_ciou = np.mean(final_cious_all)
-    std_final_ciou = np.std(final_cious_all)
-    max_final_ciou = np.max(final_cious_all)
+    mean_final_giou = np.mean(final_gious_all)
+    std_final_giou = np.std(final_gious_all)
+    max_final_giou = np.max(final_gious_all)
+    mean_final_diou = np.mean(final_dious_all)
+    std_final_diou = np.std(final_dious_all)
+    max_final_diou = np.max(final_dious_all)
 
     mean_best_iou = np.mean(best_ious_all)
     std_best_iou = np.std(best_ious_all)
     max_best_iou = np.max(best_ious_all)
-    mean_best_ciou = np.mean(best_cious_all)
-    std_best_ciou = np.std(best_cious_all)
-    max_best_ciou = np.max(best_cious_all)
+    mean_best_giou = np.mean(best_gious_all)
+    std_best_giou = np.std(best_gious_all)
+    max_best_giou = np.max(best_gious_all)
+    mean_best_diou = np.mean(best_dious_all)
+    std_best_diou = np.std(best_dious_all)
+    max_best_diou = np.max(best_dious_all)
 
     mean_reward = np.mean(total_rewards_all)
     std_reward = np.std(total_rewards_all)
@@ -1787,17 +1919,19 @@ def run_test(args, device, test_ds):
     with open(summary_path, "w", newline="") as f:
         csv_writer = csv.writer(f)
         csv_writer.writerow([
-            "image_index", "final_iou", "final_ciou",
-            "best_iou", "best_ciou",
+            "image_index", "final_iou", "final_giou", "final_diou",
+            "best_iou", "best_giou", "best_diou",
             "total_reward", "steps", "triggered"
         ])
         for idx in range(n_test):
             csv_writer.writerow([
                 idx,
                 f"{final_ious_all[idx]:.4f}",
-                f"{final_cious_all[idx]:.4f}",
+                f"{final_gious_all[idx]:.4f}",
+                f"{final_dious_all[idx]:.4f}",
                 f"{best_ious_all[idx]:.4f}",
-                f"{best_cious_all[idx]:.4f}",
+                f"{best_gious_all[idx]:.4f}",
+                f"{best_dious_all[idx]:.4f}",
                 f"{total_rewards_all[idx]:.2f}",
                 steps_all[idx],
                 triggered_all[idx]
@@ -1807,10 +1941,12 @@ def run_test(args, device, test_ds):
     print(f"[INFO] Test completato su {n_test} immagini.")
     print(f"[INFO] ── Metriche di fine episodio ──")
     print(f"[INFO] Final IoU  : media {mean_final_iou:.4f} ± {std_final_iou:.4f}, max {max_final_iou:.4f}")
-    print(f"[INFO] Final CIoU : media {mean_final_ciou:.4f} ± {std_final_ciou:.4f}, max {max_final_ciou:.4f}")
+    print(f"[INFO] Final GIoU : media {mean_final_giou:.4f} ± {std_final_giou:.4f}, max {max_final_giou:.4f}")
+    print(f"[INFO] Final DIoU : media {mean_final_diou:.4f} ± {std_final_diou:.4f}, max {max_final_diou:.4f}")
     print(f"[INFO] ── Migliori metriche durante l'episodio ──")
     print(f"[INFO] Best IoU   : media {mean_best_iou:.4f} ± {std_best_iou:.4f}, max {max_best_iou:.4f}")
-    print(f"[INFO] Best CIoU  : media {mean_best_ciou:.4f} ± {std_best_ciou:.4f}, max {max_best_ciou:.4f}")
+    print(f"[INFO] Best GIoU  : media {mean_best_giou:.4f} ± {std_best_giou:.4f}, max {max_best_giou:.4f}")
+    print(f"[INFO] Best DIoU  : media {mean_best_diou:.4f} ± {std_best_diou:.4f}, max {max_best_diou:.4f}")
     print(f"[INFO] ── Reward e step ──")
     print(f"[INFO] Reward totale : media {mean_reward:.2f} ± {std_reward:.2f}, max {max_reward:.2f}")
     print(f"[INFO] Step          : media {mean_steps:.1f} ± {std_steps:.1f}, max {max_steps}")
@@ -1925,7 +2061,7 @@ if __name__ == "__main__":
             "image_size": [224, 224],
             "in_channels": 3,
             "train_ratio": (1501/2145),
-            "valid_ratio": (429/2145),
+            "val_ratio": (429/2145),
             "cache_pairs": False
         },
         "preprocessing": {
@@ -1947,7 +2083,7 @@ if __name__ == "__main__":
     print("[INFO] Caricamento dataset...")
 
     from dataset import get_datasets
-    train_ds, valid_ds, test_ds = get_datasets(cfg)
+    train_ds, val_ds, test_ds = get_datasets(cfg)
 
     # Verifico la tipologia di esecuzione
     if args.test:
@@ -1958,4 +2094,4 @@ if __name__ == "__main__":
         run_test(args, device, test_ds)
     else:
         # Eseguo il train
-        train(args, device, train_ds, valid_ds)
+        train(args, device, train_ds, val_ds)
