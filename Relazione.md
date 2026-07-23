@@ -12,9 +12,9 @@ Repository GitHub: https://github.com/LorenzoPinaUnimib/segmentation_rl
 
 Il progetto affronta il problema della localizzazione di tumori cerebrali in immagini di risonanza magnetica (MRI) formulandolo come un problema di decisione sequenziale: un agente osserva un'immagine e una bounding box corrente e, ad ogni passo, sceglie fra 9 azioni discrete per raffinare tale box fino a farla coincidere con la regione occupata dal tumore.
 
-Il sistema combina un backbone convoluzionale pre-addestrato e congelato (ResNet18) con una testa decisionale Dueling Double DQN, addestrata mediante una combinazione di Curriculum Learning sulla soglia di successo e Imitation Learning guidato da un oracolo con ricerca ad albero.
+Il sistema combina un backbone convoluzionale pre-addestrato e congelato (ResNet18) con una testa decisionale Dueling Double DQN, addestrata mediante Imitation Learning guidato da un oracolo con ricerca ad albero.
 
-Il reward è costruito a partire dalla metrica Complete Intersection over Union (CIoU), che fornisce segnale anche in assenza di sovrapposizione.
+Il reward è costruito sulla base dalle metriche Complete Intersection over Union (CIoU), che fornisce segnale anche in assenza di sovrapposizione, e Intersection over Union (IoU), che fornisce solamente segnale relativo alla sovrapposizione delle box.
 
 L'addestramento è ulteriormente stabilizzato da Prioritized Experience Replay, ritorni n-step, margin loss in stile DQfD e reward scaling adattivo.
 
@@ -76,11 +76,11 @@ Sul piano architetturale, questo progetto attinge a tre filoni distinti della le
 
 ## 3. Dataset
 
-È stato utilizzato il dataset [Brain Tumor Image DataSet: Semantic Segmentation](https://www.kaggle.com/datasets/pkdarabi/brain-tumor-image-dataset-semantic-segmentation), contenente 2146 immagini derivate da scansioni MRI di cervelli con tumori, suddivise in:
+È stato utilizzato il dataset [Brain Tumor Image DataSet: Semantic Segmentation](https://www.kaggle.com/datasets/pkdarabi/brain-tumor-image-dataset-semantic-segmentation), contenente 2145 immagini derivate da scansioni MRI di cervelli con tumori, suddivise in:
 
 | Split | Immagini | Frazione |
 |---|---|---|
-| Training | 1502 | ≈ 70% |
+| Training | 1501 | ≈ 70% |
 | Validation | 429 | ≈ 20% |
 | Test | 215 | ≈ 10% |
 
@@ -92,7 +92,25 @@ Le immagini vengono ridimensionate a una risoluzione fissa di 224×224×3 pixel,
 
 Per ogni immagine viene eseguita la normalizzazione (min-max) e la maschera viene binarizzata con soglia 0.5.
 
->  Placeholder — Tabella 1. Statistiche descrittive delle dimensioni delle box di ground truth (area media, area mediana, rapporto larghezza/altezza) calcolate sul training set.
+### 3.2 Analisi statistica del dataset
+
+Per valutare quanto la sua variabilità intrinseca del dataset possa influire sulle prestazioni ottenibili dall'agente, è stata condotta un'analisi statistica su un insieme di metriche geometriche e di intensità calcolate dalle maschere di ground truth.
+
+Le metriche considerate comprendono descrittori di area e forma (area_ratio, aspect_ratio, circularity, solidity, extent, eccentricity), descrittori di complessità del contorno (num_convexity_defects, max_defect_depth_norm), descrittori di posizione (dist_from_center_norm) e descrittori di intensità (color_mean_overall, grad_mean).
+
+![Train Metrics](Immagini/Train_Metrics.png)
+
+Sul training set, area_ratio (frazione di immagine occupata dal tumore) ha una media del 29% con deviazione standard di 11%, indicando come i tumori occupino principalmente una porzione molto piccola dell'immagine.
+
+Aspect_ratio mostra una distribuzione fortemente asimmetrica con una coda lunga fino a valori superiori a 3, corrispondente a lesioni molto allungate. Similmente, circularity ed eccentricity confermano una popolazione eterogenea che spazia da forme quasi circolari a forme marcatamente irregolari o allungate.
+
+Un aspetto rilevante è la distribuzione bimodale di color_mean_overall: un primo gruppo di tumori si concentra su intensità basse (tra 0.0 e 0.3) e un secondo su intensità alte (tra 0.7 e 0.9), con pochi casi intermedi. Questo indica che il dataset contiene due popolazioni di lesioni diverse, un fattore di variabilità visiva che l'agente deve saper generalizzare.
+
+Infine dist_from_center_norm mostra che i tumori sono mediamente decentrati rispetto al centro dell'immagine, quindi l'agente deve imparare a spostarsi in modo diverso da un caso all'altro.
+
+![Boxplot](Immagini/Boxplot.png)
+
+Il confronto fra le tre partizioni mostra una sostanziale sovrapposizione delle distribuzioni che permette di esclurere la presenza di uno shift sistematico fra esse.
 
 ---
 
@@ -362,16 +380,36 @@ L'episodio termina quando l'agente seleziona l'azione di stop.
 Alla terminazione viene aggiunto un bonus proporzionale a quanto la IoU finale supera (o non raggiunge) la soglia di successo variabile tramite Curriculum Learning:
 
 $$
-r^{\text{term}} = 10 \cdot (\text{IoU}_T - \tau \text{IoU})
+r^{\text{term}}=
+\begin{cases}
+3 + 10\left(\text{IoU}_T-\tau_{\text{iou}}\right), & \text{se } \text{IoU}_T \ge \tau_{\text{iou}}\\[6pt]
+-3 + 10\left(\text{IoU}_T-\tau_{\text{iou}}\right), & \text{se } \text{IoU}_T < \tau_{\text{iou}}
+\end{cases}
 $$
 
-Se invece l'episodio viene troncato (limite di 50 passi raggiunto senza selezionare stop), viene applicata la stessa formula con un'ulteriore penalità fissa:
+Se invece l'episodio viene troncato (limite di 50 passi raggiunto senza selezionare stop), viene applicata la formula del movimento con un'ulteriore penalità:
 
 $$
-r^{\text{trunc}} = r^{\text{term}} - 2
+r^{\text{trunc}}
+=
+5\,\Delta\text{CIoU}
+-0.02
+-\left(1+2\max\left(\tau_{\text{iou}}-\text{IoU}_T,\;0\right)\right)
 $$
 
 Questa struttura incentiva l'agente a fermarsi quando la sovrapposizione è già buona e lo penalizza sia per uno stop prematuro con IoU bassa, sia per il mancato raggiungimento di una decisione.
+
+$$
+r =
+\begin{cases}
+3 + 10\left(\text{IoU}_T-\tau_{\text{iou}}\right), & \text{se terminato e } \text{IoU}_T \ge \tau_{\text{iou}}\\[6pt]
+-3 - 10\left(\tau_{\text{iou}}-\text{IoU}_T\right), & \text{se terminato e } \text{IoU}_T < \tau_{\text{iou}}\\[6pt]
+5\,\Delta\text{CIoU}
+-0.02
+-\left(1+2\max(\tau_{\text{iou}}-\text{IoU}_T,0)\right), & \text{se troncato}\\[6pt]
+5\,\Delta\text{CIoU} - 0.02, & \text{altrimenti}
+\end{cases}
+$$
 
 ### 9.4 Clipping e scaling
 
@@ -405,7 +443,7 @@ $$
 
 ### 10.2 Ritorni n-step
 
-Anziché un bootstrap a singolo step, le transizioni sono accumulate in code per-episodio e combinate in ritorni n-step (con un orizzonte di 50 passi, pari al limite massimo di step per episodio):
+Anziché un bootstrap a singolo step, le transizioni sono accumulate in code per-episodio e combinate in ritorni n-step (con un orizzonte di 3 passi):
 
 $$
 R_t^{(n)} = \sum_{i=0}^{n-1} \gamma^i r_{t+i}, \qquad y = R_t^{(n)} + \gamma^n Q_{\text{target}}(s_{t+n}, a^*) \cdot (1-\text{done})
@@ -433,13 +471,7 @@ Gli errori TD vengono poi utilizzati per aggiornare le priorità delle transizio
 
 L'agente apprende esclusivamente dall'interazione con l'ambiente e dal segnale di reward, senza guida esterna, selezionando le azioni con una politica $\varepsilon$-greedy rispetto ai Q-value correnti. $\varepsilon$ decresce linearmente da 1.0 a 0.05 nella prima metà del training.
 
-### 11.2 Curriculum Learning sulla soglia di successo
-
-La soglia di IoU richiesta per considerare corretto un trigger (usata sia dall'oracolo per decidere quando fermarsi sia come criterio di successo interno all'ambiente) non è fissa ma segue un curriculum: parte da un valore più permissivo (0.6) e cresce linearmente fino al valore obiettivo (0.8) entro una frazione configurabile delle epoche totali (pari al 60%).
-
-L'idea è permettere all'agente di consolidare prima una politica di localizzazione approssimativa, per poi essere gradualmente spinto verso una precisione maggiore.
-
-### 11.3 Imitation Learning guidato da un oracolo con lookahead
+### 11.2 Imitation Learning guidato da un oracolo con lookahead
 
 Ad ogni epoca, con probabilità decrescente (stesso schema di decadimento lineare di $\varepsilon$, con un valore minimo residuo), l'azione eseguita non è quella scelta dalla policy ma quella suggerita da un oracolo.
 
@@ -447,13 +479,15 @@ L'oracolo non si limita a un criterio greedy a un passo, ma esegue una ricerca a
 
 Le transizioni generate mentre l'agente è guidato dall'oracolo vengono marcate con un'etichetta, utilizzata sia per il salvataggio nel replay buffer sia per la margin loss descritta di seguito.
 
-### 11.4 Esplorazione epsilon-greedy residuale
+L'oracolo guida l'agente ad ottenere un 80% di IoU totale, al fine di permettere all'agente di comprendere meglio la zona dell'immagine interessata.
+
+### 11.3 Esplorazione epsilon-greedy residuale
 
 Quando una transizione non è guidata dall'oracolo, l'azione è comunque soggetta a esplorazione $\varepsilon$-greedy standard: con probabilità $\varepsilon$ viene scelta un'azione casuale uniforme fra le 9 disponibili, altrimenti l'azione greedy della policy corrente.
 
 Questo garantisce che l'agente continui a esplorare autonomamente anche nelle fasi in cui il teacher è ancora relativamente presente.
 
-### 11.5 Margin loss in stile DQfD
+### 11.4 Margin loss in stile DQfD
 
 Per le transizioni marcate come provenienti dall'oracolo, alla loss TD viene sommato un termine di margin loss che spinge il Q-value dell'azione dimostrata dall'oracolo ad essere superiore di almeno un margine fisso (pari a 0.8) rispetto a quello di qualunque altra azione:
 
@@ -475,19 +509,19 @@ Questo termine accelera l'apprendimento imitativo delle azioni suggerite dall'or
 
 | Iperparametro | Valore |
 |---|---|
-| Numero di epoche | 150 |
-| Batch size (episodi paralleli) | 32 |
+| Numero di epoche | 400 |
+| Batch size (episodi paralleli) | 64 |
 | Learning rate | 1e-4 |
 | Ottimizzatore | Adam (con weight decay 1e-4) |
-| Discount factor $\gamma$ | 0.98 |
+| Discount factor $\gamma$ | 0.90 |
 | Step massimi per episodio | 50 |
 | Dimensione embedding | 512 |
 | Lunghezza storia azioni | 10 |
 | Capacità replay buffer | 100.000 transizioni |
 | PER $\alpha$ / $\beta$ (start→end) | 0.6 / 0.4 → 1.0 |
-| N-step | 50 |
-| $\varepsilon$ (start→end) | 1.0 → 0.05 |
-| $\tau_{IoU}$ (start→target, curriculum) | 0.6 → 0.8 |
+| N-step | 3 |
+| $\varepsilon$ (start→end) | 1.0 → 0.1 |
+| $\tau_{IoU}$ | 0.6 |
 | Margine DQfD | 0.8 |
 | Target network $\tau$ (soft update) | 0.01 |
 | Reward clipping | ±10 |
@@ -502,35 +536,60 @@ I checkpoint includono lo stato di policy network, target network, ottimizzatore
 
 \newpage
 
-## 13. Risultati (da qua in poi da rivedere in base alle immagini scelte)
+## 13. Risultati
 
-Dopo l'addestramento per 150 epoche (batch da 64 immagini per epoca), si osservano i seguenti andamenti qualitativi:
+Dopo l'addestramento per 400 epoche (batch da 64 immagini per epoca), si osservano i seguenti andamenti qualitativi:
 
-- la reward di training parte da valori elevati, sostenuta dalla forte presenza del teacher nelle prime epoche, decresce progressivamente fino a circa l'epoca 50 (man mano che la probabilità di guida dell'oracolo scende e l'agente è "lasciato solo"), per poi risalire e assestarsi attorno a un valore prossimo a 2;
-- la reward di validation parte invece da valori negativi (circa −3, coerentemente con un agente ancora poco addestrato e privo di guida del teacher in valutazione) e cresce monotonicamente nel corso delle epoche, raggiungendo una media di circa 1.5;
-- la IoU media in validation si assesta, verso la fine dell'addestramento, attorno al 55%.
+![Train Teacher](Immagini/Train_Teacher.png)
+![Train Epsilon](Immagini/Train_Epsilon.png)
+![Train Reward](Immagini/Train_Reward.png)
 
->  Placeholder — Figura 6. Curva della reward media di training vs. epoca (dal log TensorBoard corrispondente).
+La reward di training parte da valori elevati, sostenuta dalla forte presenza del teacher nelle prime epoche, decresce progressivamente fino a circa l'epoca 100 (man mano che la probabilità di guida dell'oracolo scende e l'agente è "lasciato solo"), per poi risalire (man mano che epsilon, ovvero la probabilità di effettuare un'azione casuale, diminuisce) e assestarsi attorno a un valore prossimo a 3.
 
->  Placeholder — Figura 7. Curva della reward media di validation vs. epoca (dai log TensorBoard corrispondenti).
+![Val Reward](Immagini/Val_Reward.png)
 
->  Placeholder — Figura 8. Curva della IoU media (finale e migliore durante l'episodio) di validation vs. epoca.
+La reward di validation parte invece da valori negativi (circa −5, coerentemente con un agente ancora poco addestrato e privo di guida del teacher in valutazione) e cresce nel corso delle epoche, raggiungendo una media di circa 2.
 
->  Placeholder — Tabella 3. Metriche finali sul test set, generate dalla procedura di test (colonne: IoU media±dev.std./max, GIoU, DIoU, reward totale, numero di step medio, success rate a soglia 0.6, percentuale di episodi terminati con trigger esplicito vs. troncati) — da compilare a partire dal file riassuntivo dei risultati di test.
+![Train IoU](Immagini/Train_IoU.png)
+![Val IoU](Immagini/Val_IoU.png)
 
->  Placeholder — Figura 9. Esempi qualitativi di traiettorie dell'agente (sequenza di box durante un episodio) su 2–3 immagini di test, incluso almeno un caso di successo e un caso di fallimento.
+La IoU media in training si comporta in linea con la reward, mentre in validation si assesta, verso la fine dell'addestramento, attorno al 55%.
+
+![Val Step Avg](Immagini/Val_Step_Avg.png)
+
+Il numero medio di passi effettuati da ciascun agente nella validation diminuisce, coerentemenre ad un agente che termina la sua esecuzione, e si assesta ad una media di 25 passi per esecuzione.
+
+### 13.1 Risultati sul test set
+
+I risultati finali ottenuti sul test set (mai visto prima dal modello) confermano quanto visto precedentemente.
+
+Su 215 immagini l'agente ha ottenuto una IoU media del 55% e ha terminato volontariamente l'episodio in 205 casi (≈95,3%). Considerando invece solo gli episodi terminati volontariamente la IoU media finale è pari ad un 58%.
+
+Il success rate (la frazione di episodi terminati con una IoU finale superiore alla soglia di successo $\tau_{IoU}=0,6$) è pari a 51%: poco più della metà delle localizzazioni terminate raggiunge quindi una sovrapposizione giudicata soddisfacente.
 
 ---
 
 ## 14. Analisi e discussione
 
-Il calo iniziale della reward di training tra le epoche 0–50 è coerente con l'atteso: mentre la probabilità di guida dell'oracolo decresce, l'agente perde progressivamente il supporto dell'oracolo e deve fare maggiore affidamento sulla propria politica, ancora poco raffinata, generando episodi meno efficienti (più step, terminazioni premature o tardive). La successiva ripresa suggerisce che il segnale TD, combinato con il curriculum sulla soglia di successo e con la margin loss DQfD sulle transizioni residue dell'oracolo, sia sufficiente a consolidare una politica autonoma via via più competente.
+Il calo iniziale della reward di training tra le epoche 0–40 è coerente con l'atteso: mentre la probabilità di guida dell'oracolo decresce, l'agente perde progressivamente il supporto dell'oracolo e deve fare maggiore affidamento sulla propria politica, ancora poco raffinata, e l'elevata probabilità di scoperta a causa dalla epsilon, generando episodi meno efficienti (più step, terminazioni premature o tardive). La successiva ripresa suggerisce che il segnale TD, combinato con il curriculum sulla soglia di successo e con la margin loss DQfD sulle transizioni residue dell'oracolo, sia sufficiente a consolidare una politica autonoma via via più competente.
 
 Il gap iniziale negativo della reward di validation (assente nel training grazie al teacher) evidenzia correttamente la differenza fra prestazioni assistite e prestazioni della sola policy appresa: è la metrica più onesta per giudicare il reale progresso dell'agente, ed è positivo che converga a un valore comparabile a quello di training.
 
 Un valore di IoU media attorno al 55% è ragionevole considerando la risoluzione discreta e relativamente grossolana dei movimenti disponibili (passi proporzionali al 10% della dimensione corrente, con soglia minima assoluta), che limita la precisione fine raggiungibile e l'eterogeneità del dataset, che include casi con tumori molto piccoli o dai contorni poco definiti, più difficili da localizzare con un bounding box.
 
 ---
+
+### 3.3 Effetto della varianza del dataset sulla soglia di successo (τ = 0.6)
+
+L'analisi precedente permette di interpretare in modo più preciso il valore di IoU media di validation, che si assesta attorno al 55%, poco al di sotto della soglia di successo $\tau_{IoU} = 0.6$ usata sia nel reward di terminazione sia nella valutazione finale (Sezione 12).
+
+Diversi elementi della variabilità del dataset concorrono a spiegare questo scostamento:
+
+- **Area ridotta e variabile**: con `area_ratio` medio del 2.9% e coefficiente di variazione del 38%, una frazione consistente di tumori occupa una porzione minima dell'immagine. Per box di dimensioni così piccole, uno scostamento anche di pochi pixel tra la box predetta e quella di ground truth produce una caduta relativa di IoU molto più marcata rispetto a un tumore grande, a parità di errore assoluto di posizionamento. La granularità discreta delle azioni (spostamenti/ridimensionamenti proporzionali al 10% della box corrente) rende quindi strutturalmente più difficile raggiungere una IoU elevata sui casi di area minima.
+- **Forma irregolare**: i tumori con bassa `solidity`/`circularity` e alto `max_defect_depth_norm` hanno per definizione un contorno che non è ben approssimato da un rettangolo assiale: anche una bounding box "perfettamente centrata" sul tumore include necessariamente porzioni di tessuto sano o esclude porzioni di lesione nelle concavità, ponendo un limite superiore alla IoU ottenibile indipendentemente dalla qualità della policy.
+- **Bimodalità di intensità e decentramento**: la distribuzione bimodale di `color_mean_overall` e la variabilità di `dist_from_center_norm` aumentano l'eterogeneità dei casi che la stessa policy deve gestire, rendendo meno stabile la convergenza verso un comportamento ottimale uniforme su tutto il dataset; alcuni sottogruppi di immagini (es. tumori piccoli, iperintensi e periferici) risultano sistematicamente più difficili di altri.
+
+In sintesi, la media di IoU del 55% non va letta come un limite della sola policy appresa, ma come il risultato aggregato di una popolazione di casi con difficoltà intrinseca molto eterogenea: una parte del dataset (tumori piccoli, irregolari o periferici) ha verosimilmente una IoU massima raggiungibile inferiore alla soglia 0.6, mentre i casi più regolari e centrati la superano ampiamente, e la media complessiva ne rappresenta il bilanciamento.
 
 \newpage
 
