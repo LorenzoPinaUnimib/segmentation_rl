@@ -461,22 +461,22 @@ Questo termine accelera l'apprendimento imitativo delle azioni suggerite dall'or
 |---|---|
 | Numero di epoche | 400 |
 | Batch size (episodi paralleli) | 64 |
+| Step massimi per episodio | 50 |
+| $\tau_{IoU}$ | 0.6 |
+| Soglia Teacher | 0.8 |
+| $\varepsilon$ (start→end) | 1.0 → 0.1 |
+| Teacher (start→end) | 1.0 → 0.1 |
 | Learning rate | 1e-4 |
 | Ottimizzatore | Adam (con weight decay 1e-4) |
 | Discount factor $\gamma$ | 0.90 |
-| Step massimi per episodio | 50 |
 | Dimensione embedding | 512 |
 | Lunghezza storia azioni | 10 |
 | Capacità replay buffer | 100.000 transizioni |
 | PER $\alpha$ / $\beta$ (start→end) | 0.6 / 0.4 → 1.0 |
 | N-step | 3 |
-| $\varepsilon$ (start→end) | 1.0 → 0.1 |
-| $\tau_{IoU}$ | 0.6 |
 | Margine DQfD | 0.8 |
 | Target network $\tau$ (soft update) | 0.01 |
 | Reward clipping | ±10 |
-| Soglia di successo (reward terminazione) | 0.6 |
-| Soglia di successo (valutazione IoU) | 0.6 |
 
 L'addestramento è monitorato tramite TensorBoard, con log per-step (IoU / GIoU / DIoU / CIoU correnti, $\varepsilon$, probabilità di guida dell'oracolo, deviazione standard del reward scaler) e per-epoca (metriche finali e "migliori durante l'episodio" di training e validation, loss media, success rate).
 
@@ -513,33 +513,31 @@ Il numero medio di passi effettuati da ciascun agente nella validation diminuisc
 
 I risultati finali ottenuti sul test set (mai visto prima dal modello) confermano quanto visto precedentemente.
 
-Su 215 immagini l'agente ha ottenuto una IoU media del 55% e ha terminato volontariamente l'episodio in 205 casi (≈95,3%). Considerando invece solo gli episodi terminati volontariamente la IoU media finale è pari ad un 58%.
+Su 215 immagini l'agente ha ottenuto una IoU media del 55% e ha terminato volontariamente l'episodio in 205 casi (≈95,3%). Considerando solo gli episodi terminati volontariamente la IoU media finale è pari ad un 58%.
 
-Il success rate (la frazione di episodi terminati con una IoU finale superiore alla soglia di successo $\tau_{IoU}=0,6$) è pari a 51%: poco più della metà delle localizzazioni terminate raggiunge quindi una sovrapposizione giudicata soddisfacente.
+Il success rate (la frazione di episodi terminati con una IoU finale superiore alla soglia di successo $\tau_{IoU}$ = 0,6) è pari a 51%: poco più della metà delle localizzazioni terminate raggiunge quindi una sovrapposizione giudicata soddisfacente.
+
+![Test 29 fine](Immagini/Test%2029%20fine.png)
+![Test 47 fine](Immagini/Test%2047%20fine.png)
+
+Andando ad analizzare alcuni esempi in cui l’agente non termina e ottiene un valore di IoU pari a 0 emerge che il tumore risulta difficoltoso da discriminare anche a livello visivo. In particolare, nei casi osservati, la struttura tumorale presenta caratteristiche tali da confondersi con il contesto dell’immagine rendendo più complessa la localizzazione precisa.
+
+![Test 21 inizio](Immagini/Test%2021%20inizio.png)
+![Test 21 fine](Immagini/Test%2021%20fine.png)
+
+Inoltre, è presente un caso in cui l’agente termina l’esplorazione ma ottiene IoU pari a 0: la presenza di un’area con aspetto simile a quello del tumore induce una localizzazione errata durante l’esecuzione, nonostante una prima individuazione corretta della zona tumorale.
 
 ---
 
 ## 14. Analisi e discussione
 
-Il calo iniziale della reward di training tra le epoche 0–40 è coerente con l'atteso: mentre la probabilità di guida dell'oracolo decresce, l'agente perde progressivamente il supporto dell'oracolo e deve fare maggiore affidamento sulla propria politica, ancora poco raffinata, e l'elevata probabilità di scoperta a causa dalla epsilon, generando episodi meno efficienti (più step, terminazioni premature o tardive). La successiva ripresa suggerisce che il segnale TD, combinato con il curriculum sulla soglia di successo e con la margin loss DQfD sulle transizioni residue dell'oracolo, sia sufficiente a consolidare una politica autonoma via via più competente.
+Il calo iniziale della reward di training tra le epoche 0–100 è coerente con l'atteso: mentre la probabilità di guida dell'oracolo decresce, l'agente perde progressivamente il supporto dell'oracolo e deve fare maggiore affidamento sulla propria politica, ancora poco raffinata, e l'elevata probabilità di scoperta a causa dalla epsilon, generando episodi meno efficienti (più step, terminazioni premature o tardive). La successiva ripresa suggerisce che il segnale TD, combinato con la margin loss DQfD sulle transizioni residue dell'oracolo, sia sufficiente a consolidare una politica autonoma via via più competente.
 
 Il gap iniziale negativo della reward di validation (assente nel training grazie al teacher) evidenzia correttamente la differenza fra prestazioni assistite e prestazioni della sola policy appresa: è la metrica più onesta per giudicare il reale progresso dell'agente, ed è positivo che converga a un valore comparabile a quello di training.
 
 Un valore di IoU media attorno al 55% è ragionevole considerando la risoluzione discreta e relativamente grossolana dei movimenti disponibili (passi proporzionali al 10% della dimensione corrente, con soglia minima assoluta), che limita la precisione fine raggiungibile e l'eterogeneità del dataset, che include casi con tumori molto piccoli o dai contorni poco definiti, più difficili da localizzare con un bounding box.
 
 ---
-
-### 3.3 Effetto della varianza del dataset sulla soglia di successo (τ = 0.6)
-
-L'analisi precedente permette di interpretare in modo più preciso il valore di IoU media di validation, che si assesta attorno al 55%, poco al di sotto della soglia di successo $\tau_{IoU} = 0.6$ usata sia nel reward di terminazione sia nella valutazione finale (Sezione 12).
-
-Diversi elementi della variabilità del dataset concorrono a spiegare questo scostamento:
-
-- **Area ridotta e variabile**: con `area_ratio` medio del 2.9% e coefficiente di variazione del 38%, una frazione consistente di tumori occupa una porzione minima dell'immagine. Per box di dimensioni così piccole, uno scostamento anche di pochi pixel tra la box predetta e quella di ground truth produce una caduta relativa di IoU molto più marcata rispetto a un tumore grande, a parità di errore assoluto di posizionamento. La granularità discreta delle azioni (spostamenti/ridimensionamenti proporzionali al 10% della box corrente) rende quindi strutturalmente più difficile raggiungere una IoU elevata sui casi di area minima.
-- **Forma irregolare**: i tumori con bassa `solidity`/`circularity` e alto `max_defect_depth_norm` hanno per definizione un contorno che non è ben approssimato da un rettangolo assiale: anche una bounding box "perfettamente centrata" sul tumore include necessariamente porzioni di tessuto sano o esclude porzioni di lesione nelle concavità, ponendo un limite superiore alla IoU ottenibile indipendentemente dalla qualità della policy.
-- **Bimodalità di intensità e decentramento**: la distribuzione bimodale di `color_mean_overall` e la variabilità di `dist_from_center_norm` aumentano l'eterogeneità dei casi che la stessa policy deve gestire, rendendo meno stabile la convergenza verso un comportamento ottimale uniforme su tutto il dataset; alcuni sottogruppi di immagini (es. tumori piccoli, iperintensi e periferici) risultano sistematicamente più difficili di altri.
-
-In sintesi, la media di IoU del 55% non va letta come un limite della sola policy appresa, ma come il risultato aggregato di una popolazione di casi con difficoltà intrinseca molto eterogenea: una parte del dataset (tumori piccoli, irregolari o periferici) ha verosimilmente una IoU massima raggiungibile inferiore alla soglia 0.6, mentre i casi più regolari e centrati la superano ampiamente, e la media complessiva ne rappresenta il bilanciamento.
 
 <div style="page-break-after: always;"></div>
 
