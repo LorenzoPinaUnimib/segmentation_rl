@@ -1,3 +1,19 @@
+<style>
+  /* Forza l'SVG a stare nei limiti della pagina A4 stampabile */
+  .diagramma-svg, img[src$=".svg"] {
+    max-width: 100% !important;
+    max-height: 80vh !important; /* Limita l'altezza all'80% dell'altezza della pagina */
+    height: auto !important;
+    width: auto !important;
+    display: block;
+    margin: 1em auto;
+    
+    /* Impedisce al motore PDF di spezzare il diagramma su due pagine */
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+  }
+</style>
+
 # Localizzazione di tumori cerebrali da MRI mediante Reinforcement Learning con Imitation Learning guidato
 
 Relazione di Progetto di Sistemi Complessi: Modelli e Simulazione
@@ -7,6 +23,8 @@ Pina Lorenzo 894396 e Rancati Simone 900052
 Repository GitHub: https://github.com/LorenzoPinaUnimib/segmentation_rl
 
 ---
+
+<div style="page-break-after: always;"></div>
 
 ## Abstract
 
@@ -20,7 +38,7 @@ L'addestramento è ulteriormente stabilizzato da Prioritized Experience Replay, 
 
 ---
 
-\newpage
+<div style="page-break-after: always;"></div>
 
 ## Indice
 
@@ -44,7 +62,7 @@ L'addestramento è ulteriormente stabilizzato da Prioritized Experience Replay, 
 
 ---
 
-\newpage
+<div style="page-break-after: always;"></div>
 
 ## 1. Introduzione
 
@@ -64,7 +82,7 @@ Durante lo svolgimento del progetto ci siamo occupati di integrare varie tecnich
 
 ---
 
-\newpage
+<div style="page-break-after: always;"></div>
 
 ## 2. Lavori correlati (da rivedere)
 
@@ -73,6 +91,8 @@ L'idea di trattare la localizzazione visiva come una sequenza di azioni discrete
 Sul piano architetturale, questo progetto attinge a tre filoni distinti della letteratura RL "classica": le architetture Dueling [5], che separano la stima del valore dello stato da quella del vantaggio relativo di ciascuna azione; il Double Q-learning [6], che riduce la sovrastima dei Q-value disaccoppiando selezione e valutazione dell'azione greedy; e il Prioritized Experience Replay [7], che campiona con probabilità proporzionale all'errore TD le transizioni più "informative". Il meccanismo di imitation learning guidato da un oracolo è ispirato al framework DQfD (Deep Q-learning from Demonstrations) [8], che combina una loss TD standard con una margin loss che spinge i Q-value delle azioni dimostrate dall'esperto ad essere superiori di un margine fisso rispetto alle alternative. Infine, per il reward shaping il progetto adotta metriche di sovrapposizione più informative della IoU classica, in particolare GIoU [11] e DIoU/CIoU [10], originariamente proposte come funzioni di loss per la regressione di bounding box in task di object detection.
 
 ---
+
+<div style="page-break-after: always;"></div>
 
 ## 3. Dataset
 
@@ -114,7 +134,7 @@ Il confronto fra le tre partizioni mostra una sostanziale sovrapposizione delle 
 
 ---
 
-\newpage
+<div style="page-break-after: always;"></div>
 
 ## 4. Formulazione del problema come MDP
 
@@ -134,7 +154,7 @@ L'ambiente è implementato in forma vettorizzata, simulando in parallelo un inte
 
 ---
 
-\newpage
+<div style="page-break-after: always;"></div>
 
 ## 5. Rappresentazione dello stato
 
@@ -149,11 +169,11 @@ La dimensione totale del vettore di coordinate / contesto è quindi di 11 valori
 
 Figura 2. Schema a blocchi della pipeline di osservazione:
 
-![Pipeline](Immagini/Pipeline.svg)
+<img src="Immagini/Pipeline.svg" class="diagramma-svg" alt="Pipeline">
 
 ---
 
-\newpage
+<div style="page-break-after: always;"></div>
 
 ## 6. Architettura del modello
 
@@ -200,11 +220,11 @@ $$
 
 Figura 3. Diagramma dell'architettura completa:
 
-![Architettura](Immagini/Architettura.svg)
+<img src="Immagini/Architettura.svg" class="diagramma-svg" alt="Architettura">
 
 ---
 
-\newpage
+<br>
 
 ## 7. Spazio delle azioni e dinamica dell'ambiente
 
@@ -230,7 +250,7 @@ Ogni trasformazione è vincolata in modo che:
 
 ---
 
-\newpage
+<div style="page-break-after: always;"></div>
 
 ## 8. Metriche di sovrapposizione
 
@@ -277,7 +297,7 @@ La CIoU combina quindi tre criteri di sovrapposizione (area, distanza dei centri
 
 ---
 
-\newpage
+<div style="page-break-after: always;"></div>
 
 ## 9. Reward shaping
 
@@ -349,7 +369,7 @@ Prima di essere inserito nel replay buffer, il reward viene inoltre normalizzato
 
 ---
 
-\newpage
+<div style="page-break-after: always;"></div>
 
 ## 10. Meccanismi di stabilizzazione dell'apprendimento
 
@@ -393,7 +413,7 @@ Gli errori TD vengono poi utilizzati per aggiornare le priorità delle transizio
 
 ---
 
-\newpage
+<div style="page-break-after: always;"></div>
 
 ## 11. Strategie di addestramento
 
@@ -433,7 +453,7 @@ Questo termine accelera l'apprendimento imitativo delle azioni suggerite dall'or
 
 ---
 
-\newpage
+<div style="page-break-after: always;"></div>
 
 ## 12. Setup sperimentale
 
@@ -464,7 +484,7 @@ I checkpoint includono lo stato di policy network, target network, ottimizzatore
 
 ---
 
-\newpage
+<div style="page-break-after: always;"></div>
 
 ## 13. Risultati
 
@@ -521,7 +541,7 @@ Diversi elementi della variabilità del dataset concorrono a spiegare questo sco
 
 In sintesi, la media di IoU del 55% non va letta come un limite della sola policy appresa, ma come il risultato aggregato di una popolazione di casi con difficoltà intrinseca molto eterogenea: una parte del dataset (tumori piccoli, irregolari o periferici) ha verosimilmente una IoU massima raggiungibile inferiore alla soglia 0.6, mentre i casi più regolari e centrati la superano ampiamente, e la media complessiva ne rappresenta il bilanciamento.
 
-\newpage
+<div style="page-break-after: always;"></div>
 
 ## 15. Limiti e sviluppi futuri
 
@@ -530,7 +550,7 @@ In sintesi, la media di IoU del 55% non va letta come un limite della sola polic
 
 ---
 
-\newpage
+<div style="page-break-after: always;"></div>
 
 ## 16. Conclusioni
 
@@ -540,7 +560,7 @@ I risultati ottenuti confermano l'efficacia complessiva dell'approccio, pur lasc
 
 ---
 
-\newpage
+<div style="page-break-after: always;"></div>
 
 ## 17. Bibliografia
 
