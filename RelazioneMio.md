@@ -92,7 +92,25 @@ Le immagini vengono ridimensionate a una risoluzione fissa di 224×224×3 pixel,
 
 Per ogni immagine viene eseguita la normalizzazione (min-max) e la maschera viene binarizzata con soglia 0.5.
 
->  Placeholder — Tabella 1. Statistiche descrittive delle dimensioni delle box di ground truth (area media, area mediana, rapporto larghezza/altezza) calcolate sul training set.
+### 3.2 Analisi statistica del dataset
+
+Per valutare quanto la sua variabilità intrinseca del dataset possa influire sulle prestazioni ottenibili dall'agente, è stata condotta un'analisi statistica su un insieme di metriche geometriche e di intensità calcolate dalle maschere di ground truth.
+
+Le metriche considerate comprendono descrittori di area e forma (area_ratio, aspect_ratio, circularity, solidity, extent, eccentricity), descrittori di complessità del contorno (num_convexity_defects, max_defect_depth_norm), descrittori di posizione (dist_from_center_norm) e descrittori di intensità (color_mean_overall, grad_mean).
+
+![Train Metrics](Immagini/Train_Metrics.png)
+
+Sul training set, area_ratio (frazione di immagine occupata dal tumore) ha una media del 29% con deviazione standard di 11%, indicando come i tumori occupino principalmente una porzione molto piccola dell'immagine.
+
+Aspect_ratio mostra una distribuzione fortemente asimmetrica con una coda lunga fino a valori superiori a 3, corrispondente a lesioni molto allungate. Similmente, circularity ed eccentricity confermano una popolazione eterogenea che spazia da forme quasi circolari a forme marcatamente irregolari o allungate.
+
+Un aspetto rilevante è la distribuzione bimodale di color_mean_overall: un primo gruppo di tumori si concentra su intensità basse (tra 0.0 e 0.3) e un secondo su intensità alte (tra 0.7 e 0.9), con pochi casi intermedi. Questo indica che il dataset contiene due popolazioni di lesioni diverse, un fattore di variabilità visiva che l'agente deve saper generalizzare.
+
+Infine dist_from_center_norm mostra che i tumori sono mediamente decentrati rispetto al centro dell'immagine, quindi l'agente deve imparare a spostarsi in modo diverso da un caso all'altro.
+
+![Boxplot](Immagini/Boxplot.png)
+
+Il confronto fra le tre partizioni mostra una sostanziale sovrapposizione delle distribuzioni che permette di esclurere la presenza di uno shift sistematico fra esse.
 
 ---
 
@@ -552,6 +570,18 @@ Il gap iniziale negativo della reward di validation (assente nel training grazie
 Un valore di IoU media attorno al 55% è ragionevole considerando la risoluzione discreta e relativamente grossolana dei movimenti disponibili (passi proporzionali al 10% della dimensione corrente, con soglia minima assoluta), che limita la precisione fine raggiungibile e l'eterogeneità del dataset, che include casi con tumori molto piccoli o dai contorni poco definiti, più difficili da localizzare con un bounding box.
 
 ---
+
+### 3.3 Effetto della varianza del dataset sulla soglia di successo (τ = 0.6)
+
+L'analisi precedente permette di interpretare in modo più preciso il valore di IoU media di validation, che si assesta attorno al 55%, poco al di sotto della soglia di successo $\tau_{IoU} = 0.6$ usata sia nel reward di terminazione sia nella valutazione finale (Sezione 12).
+
+Diversi elementi della variabilità del dataset concorrono a spiegare questo scostamento:
+
+- **Area ridotta e variabile**: con `area_ratio` medio del 2.9% e coefficiente di variazione del 38%, una frazione consistente di tumori occupa una porzione minima dell'immagine. Per box di dimensioni così piccole, uno scostamento anche di pochi pixel tra la box predetta e quella di ground truth produce una caduta relativa di IoU molto più marcata rispetto a un tumore grande, a parità di errore assoluto di posizionamento. La granularità discreta delle azioni (spostamenti/ridimensionamenti proporzionali al 10% della box corrente) rende quindi strutturalmente più difficile raggiungere una IoU elevata sui casi di area minima.
+- **Forma irregolare**: i tumori con bassa `solidity`/`circularity` e alto `max_defect_depth_norm` hanno per definizione un contorno che non è ben approssimato da un rettangolo assiale: anche una bounding box "perfettamente centrata" sul tumore include necessariamente porzioni di tessuto sano o esclude porzioni di lesione nelle concavità, ponendo un limite superiore alla IoU ottenibile indipendentemente dalla qualità della policy.
+- **Bimodalità di intensità e decentramento**: la distribuzione bimodale di `color_mean_overall` e la variabilità di `dist_from_center_norm` aumentano l'eterogeneità dei casi che la stessa policy deve gestire, rendendo meno stabile la convergenza verso un comportamento ottimale uniforme su tutto il dataset; alcuni sottogruppi di immagini (es. tumori piccoli, iperintensi e periferici) risultano sistematicamente più difficili di altri.
+
+In sintesi, la media di IoU del 55% non va letta come un limite della sola policy appresa, ma come il risultato aggregato di una popolazione di casi con difficoltà intrinseca molto eterogenea: una parte del dataset (tumori piccoli, irregolari o periferici) ha verosimilmente una IoU massima raggiungibile inferiore alla soglia 0.6, mentre i casi più regolari e centrati la superano ampiamente, e la media complessiva ne rappresenta il bilanciamento.
 
 \newpage
 
