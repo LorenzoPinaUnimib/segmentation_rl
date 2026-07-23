@@ -12,9 +12,9 @@ Repository GitHub: https://github.com/LorenzoPinaUnimib/segmentation_rl
 
 Il progetto affronta il problema della localizzazione di tumori cerebrali in immagini di risonanza magnetica (MRI) formulandolo come un problema di decisione sequenziale: un agente osserva un'immagine e una bounding box corrente e, ad ogni passo, sceglie fra 9 azioni discrete per raffinare tale box fino a farla coincidere con la regione occupata dal tumore.
 
-Il sistema combina un backbone convoluzionale pre-addestrato e congelato (ResNet18) con una testa decisionale Dueling Double DQN, addestrata mediante una combinazione di Curriculum Learning sulla soglia di successo e Imitation Learning guidato da un oracolo con ricerca ad albero.
+Il sistema combina un backbone convoluzionale pre-addestrato e congelato (ResNet18) con una testa decisionale Dueling Double DQN, addestrata mediante Imitation Learning guidato da un oracolo con ricerca ad albero.
 
-Il reward è costruito a partire dalla metrica Complete Intersection over Union (CIoU), che fornisce segnale anche in assenza di sovrapposizione.
+Il reward è costruito sulla base dalle metriche Complete Intersection over Union (CIoU), che fornisce segnale anche in assenza di sovrapposizione, e Intersection over Union (IoU), che fornisce solamente segnale relativo alla sovrapposizione delle box.
 
 L'addestramento è ulteriormente stabilizzato da Prioritized Experience Replay, ritorni n-step, margin loss in stile DQfD e reward scaling adattivo.
 
@@ -76,11 +76,11 @@ Sul piano architetturale, questo progetto attinge a tre filoni distinti della le
 
 ## 3. Dataset
 
-È stato utilizzato il dataset [Brain Tumor Image DataSet: Semantic Segmentation](https://www.kaggle.com/datasets/pkdarabi/brain-tumor-image-dataset-semantic-segmentation), contenente 2146 immagini derivate da scansioni MRI di cervelli con tumori, suddivise in:
+È stato utilizzato il dataset [Brain Tumor Image DataSet: Semantic Segmentation](https://www.kaggle.com/datasets/pkdarabi/brain-tumor-image-dataset-semantic-segmentation), contenente 2145 immagini derivate da scansioni MRI di cervelli con tumori, suddivise in:
 
 | Split | Immagini | Frazione |
 |---|---|---|
-| Training | 1502 | ≈ 70% |
+| Training | 1501 | ≈ 70% |
 | Validation | 429 | ≈ 20% |
 | Test | 215 | ≈ 10% |
 
