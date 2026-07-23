@@ -503,17 +503,14 @@ Su 215 immagini l'agente ha ottenuto una IoU media del 55% e ha terminato volont
 
 Il success rate (la frazione di episodi terminati con una IoU finale superiore alla soglia di successo $\tau_{IoU}$ = 0,6) è pari a 51%: poco più della metà delle localizzazioni terminate raggiunge quindi una sovrapposizione giudicata soddisfacente.
 
-<br>
 <div style="display: flex; justify-content: center; align-items: center; gap: 20px;">
   <img src="Immagini/Test%2029%20fine.png" style="max-width: 45%; height: auto;">
   <img src="Immagini/Test%2047%20fine.png" style="max-width: 45%; height: auto;">
 </div>
 <br>
 
-
 Andando ad analizzare alcuni esempi in cui l’agente non termina e ottiene un valore di IoU pari a 0 emerge che il tumore risulta difficoltoso da discriminare anche a livello visivo. In particolare, nei casi osservati, la struttura tumorale presenta caratteristiche tali da confondersi con il contesto dell’immagine rendendo più complessa la localizzazione precisa.
 
-<br>
 <div style="display: flex; justify-content: center; align-items: center; gap: 20px;">
   <img src="Immagini/Test%2021%20inizio.png" style="max-width: 45%; height: auto;">
   <img src="Immagini/Test%2021%20fine.png" style="max-width: 45%; height: auto;">
@@ -565,12 +562,10 @@ Applicazioni RL alla localizzazione/segmentazione medicale e visiva
 3. Joseph Stember, Hrithwik Shalu. Deep reinforcement learning to detect brain lesions on MRI: a proof-of-concept application of reinforcement learning to medical images (2008). DOI 10.48550/arXiv.2008.02708, https://doi.org/10.48550/arXiv.2008.02708
 4. Juan C. Caicedo, Svetlana Lazebnik. Active Object Localization with Deep Reinforcement Learning (2015). DOI 10.48550/arXiv.1511.06015, https://doi.org/10.48550/arXiv.1511.06015
 
-Componenti algoritmiche del Deep Reinforcement Learning
+Metodologie utilizzate nell'agente
 
-5. Wang, Z., Schaul, T., Hessel, M., van Hasselt, H., Lanctot, M., de Freitas, N. *Dueling Network Architectures for Deep Reinforcement Learning* (2016). ICML. arXiv:1511.06581
-6. van Hasselt, H., Guez, A., Silver, D. *Deep Reinforcement Learning with Double Q-learning* (2016). AAAI. arXiv:1509.06461
-7. Schaul, T., Quan, J., Antonoglou, I., Silver, D. *Prioritized Experience Replay* (2016). ICLR. arXiv:1511.05952
-8. Hester, T. et al. *Deep Q-learning from Demonstrations* (2018). AAAI. arXiv:1704.03732
-9. Hessel, M., Modayil, J., van Hasselt, H., Schaul, T., Ostrovski, G., Dabney, W., Horgan, D., Piot, B., Azar, M., Silver, D. *Rainbow: Combining Improvements in Deep Reinforcement Learning* (2018). AAAI. arXiv:1710.02298
+5. Ziyu Wang, Tom Schaul, Matteo Hessel, Hado van Hasselt, Marc Lanctot, Nando de Freitas. Dueling Network Architectures for Deep Reinforcement Learning (2015). DOI 10.48550/arXiv.1511.06581, https://doi.org/10.48550/arXiv.1511.06581
+6. Hado van Hasselt, Arthur Guez, David Silver. Deep Reinforcement Learning with Double Q-learning (2015). DOI 10.48550/arXiv.1509.06461, https://doi.org/10.48550/arXiv.1509.06461
+7. Tom Schaul, John Quan, Ioannis Antonoglou, David Silver. Prioritized Experience Replay (2015). DOI 10.48550/arXiv.1511.05952, https://doi.org/10.48550/arXiv.1511.05952
 
 ---
