@@ -509,7 +509,7 @@ Questo termine accelera l'apprendimento imitativo delle azioni suggerite dall'or
 
 | Iperparametro | Valore |
 |---|---|
-| Numero di epoche | 150 |
+| Numero di epoche | 400 |
 | Batch size (episodi paralleli) | 64 |
 | Learning rate | 1e-4 |
 | Ottimizzatore | Adam (con weight decay 1e-4) |
@@ -536,15 +536,15 @@ I checkpoint includono lo stato di policy network, target network, ottimizzatore
 
 \newpage
 
-## 13. Risultati (da qua in poi da rivedere in base alle immagini scelte)
+## 13. Risultati
 
-Dopo l'addestramento per 150 epoche (batch da 64 immagini per epoca), si osservano i seguenti andamenti qualitativi:
+Dopo l'addestramento per 400 epoche (batch da 64 immagini per epoca), si osservano i seguenti andamenti qualitativi:
 
 ![Train Teacher](Immagini/Train_Teacher.png)
 ![Train Epsilon](Immagini/Train_Epsilon.png)
 ![Train Reward](Immagini/Train_Reward.png)
 
-La reward di training parte da valori elevati, sostenuta dalla forte presenza del teacher nelle prime epoche, decresce progressivamente fino a circa l'epoca 40 (man mano che la probabilità di guida dell'oracolo scende e l'agente è "lasciato solo"), per poi risalire (man mano che epsilon, ovvero la probabilità di effettuare un'azione casuale, diminuisce) e assestarsi attorno a un valore prossimo a 3.
+La reward di training parte da valori elevati, sostenuta dalla forte presenza del teacher nelle prime epoche, decresce progressivamente fino a circa l'epoca 100 (man mano che la probabilità di guida dell'oracolo scende e l'agente è "lasciato solo"), per poi risalire (man mano che epsilon, ovvero la probabilità di effettuare un'azione casuale, diminuisce) e assestarsi attorno a un valore prossimo a 3.
 
 ![Val Reward](Immagini/Val_Reward.png)
 
@@ -558,6 +558,14 @@ La IoU media in training si comporta in linea con la reward, mentre in validatio
 ![Val Step Avg](Immagini/Val_Step_Avg.png)
 
 Il numero medio di passi effettuati da ciascun agente nella validation diminuisce, coerentemenre ad un agente che termina la sua esecuzione, e si assesta ad una media di 25 passi per esecuzione.
+
+### 13.1 Risultati sul test set
+
+I risultati finali ottenuti sul test set (mai visto prima dal modello) confermano quanto visto precedentemente.
+
+Su 215 immagini l'agente ha ottenuto una IoU media del 55% e ha terminato volontariamente l'episodio in 205 casi (≈95,3%). Considerando invece solo gli episodi terminati volontariamente la IoU media finale è pari ad un 58%.
+
+Il success rate (la frazione di episodi terminati con una IoU finale superiore alla soglia di successo $\tau_{IoU}=0,6$) è pari a 51%: poco più della metà delle localizzazioni terminate raggiunge quindi una sovrapposizione giudicata soddisfacente.
 
 ---
 
