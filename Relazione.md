@@ -30,11 +30,11 @@ Repository GitHub: https://github.com/LorenzoPinaUnimib/segmentation_rl
 
 Il progetto affronta il problema della localizzazione di tumori cerebrali in immagini di risonanza magnetica (MRI) formulandolo come un problema di decisione sequenziale: un agente osserva un'immagine e una bounding box corrente e, ad ogni passo, sceglie fra 9 azioni discrete per raffinare tale box fino a farla coincidere con la regione occupata dal tumore.
 
-Il sistema combina un backbone convoluzionale pre-addestrato e congelato (ResNet18) con una testa decisionale Dueling Double DQN, addestrata mediante Imitation Learning guidato da un oracolo con ricerca ad albero.
+Il sistema combina un backbone convoluzionale pre-addestrato e congelato (ResNet18) con una testa decisionale Dueling [[5]](#ref5) Double DQN [[6]](#ref6), addestrata mediante Imitation Learning guidato da un oracolo con ricerca ad albero.
 
 Il reward è costruito sulla base dalle metriche Complete Intersection over Union (CIoU), che fornisce segnale anche in assenza di sovrapposizione, e Intersection over Union (IoU), che fornisce solamente segnale relativo alla sovrapposizione delle box.
 
-L'addestramento è ulteriormente stabilizzato da Prioritized Experience Replay, ritorni n-step, margin loss in stile DQfD e reward scaling adattivo.
+L'addestramento è ulteriormente stabilizzato da Prioritized Experience Replay [[7]](#ref7), ritorni n-step, margin loss in stile DQfD e reward scaling adattivo.
 
 ---
 
@@ -86,7 +86,7 @@ Durante lo svolgimento del progetto ci siamo occupati di integrare varie tecnich
 
 ## 2. Lavori correlati
 
-L'idea di trattare la localizzazione visiva come una sequenza di azioni discrete su una bounding box è stata introdotta in ambito RL da lavori come quello di Caicedo e Lazebnik [4], che utilizzano un agente Q-learning per muovere/ridimensionare una box su immagini naturali (dataset Pascal VOC). Stember e Shalu [1, 3] applicano un'idea analoga alla localizzazione di lesioni cerebrali su MRI, dimostrando che è possibile ottenere buone prestazioni anche con training set molto piccoli grazie al segnale denso fornito dal reward shaping. Ding et al. [2] estendono l'approccio RL alla segmentazione medicale vera e propria.
+L'idea di trattare la localizzazione visiva come una sequenza di azioni discrete su una bounding box è stata introdotta in ambito RL da lavori come quello di Caicedo e Lazebnik [[4]](#ref4), che utilizzano un agente Q-learning per muovere/ridimensionare una box su immagini naturali (dataset Pascal VOC). Stember e Shalu [[1]](#ref1), [[3]](#ref3) applicano un'idea analoga alla localizzazione di lesioni cerebrali su MRI, dimostrando che è possibile ottenere buone prestazioni anche con training set molto piccoli grazie al segnale denso fornito dal reward shaping. Ding et al. [[2]](#ref2) estendono l'approccio RL alla segmentazione medicale vera e propria.
 
 ---
 
@@ -187,7 +187,7 @@ La backbone è interamente congelata: solo la testa decisionale viene aggiornata
 
 La feature map prodotta dalla backbone (canali $512 \times 7 \times 7$ per un crop $224\times224$) viene ridotta a un vettore mediante  SpatialAttentionPool: un modulo che raffina la feature map con una convoluzione $3\times3$ + BatchNorm + ReLU, calcola una mappa di attenzione tramite convoluzione $1\times1$ seguita da softmax spaziale, produce un vettore pesato per attenzione che viene concatenato al vettore mediato classicamente, e infine proietta la concatenazione tramite un layer lineare + ReLU nello spazio di embedding finale (di dimensione 512). L'idea è combinare un riassunto generico (media) con uno selettivo (attenzione), lasciando alla rete la possibilità di enfatizzare le regioni più informative del crop.
 
-### 6.3 Testa decisionale: Dueling DQN
+### 6.3 Testa decisionale: Dueling DQN [[5]](#ref5)
 
 La rete decisionale (QNetwork) riceve in input la concatenazione di embedding visivo, storia delle azioni e feature di coordinate / bias spaziale, e la elabora con un tronco condiviso (due blocchi Linear + LayerNorm + ReLU, dimensione nascosta 512), da cui si diramano due teste distinte:
 
@@ -202,7 +202,7 @@ $$
 
 Questa separazione consente alla rete di apprendere il valore dello stato anche in situazioni in cui la scelta dell'azione specifica ha scarso impatto, migliorando tipicamente stabilità e velocità di apprendimento.
 
-### 6.4 Target network e Double DQN
+### 6.4 Target network e Double DQN [[6]](#ref6)
 
 Per stabilizzare il bootstrap del target TD viene mantenuta una rete target, copia della rete di policy, aggiornata mediante soft update ad ogni step di ottimizzazione:
 
@@ -357,9 +357,9 @@ Prima di essere inserito nel replay buffer, il reward viene inoltre normalizzato
 
 ## 10. Meccanismi di stabilizzazione dell'apprendimento
 
-Oltre a Dueling DQN, Double DQN e target network già descritti, la pipeline di addestramento integra diversi accorgimenti standard nella letteratura RL per rendere l'apprendimento più stabile e campione-efficiente su un dataset di dimensioni contenute:
+Oltre a Dueling DQN [[5]](#ref5), Double DQN [[6]](#ref6) e target network già descritti, la pipeline di addestramento integra diversi accorgimenti standard nella letteratura RL per rendere l'apprendimento più stabile e campione-efficiente su un dataset di dimensioni contenute:
 
-### 10.1 Prioritized Experience Replay (PER)
+### 10.1 Prioritized Experience Replay (PER) [[7]](#ref7)
 
 Il replay buffer (EmbeddingReplayBuffer) memorizza, per ciascuna transizione, l'embedding visivo (anziché l'immagine grezza, per risparmiare memoria), la storia delle azioni, le feature extra, azione, reward, flag di terminazione e un'etichetta per distinguere le transizioni suggerite dall'oracolo.
 
@@ -547,7 +547,7 @@ Un valore di IoU media attorno al 55% è ragionevole considerando la risoluzione
 
 Il progetto formula la localizzazione di tumori cerebrali su MRI come un problema di decisione sequenziale (MDP), risolto tramite un agente Dueling Double DQN che opera su una rappresentazione dello stato efficiente basata su RoI Align e attenzione spaziale. Il reward shaping, costruito sulla metrica CIoU, fornisce un segnale denso e informativo anche in assenza di sovrapposizione iniziale, mentre l'Imitation Learning guidato da un oracolo con lookahead accelera e stabilizza l'apprendimento, in sinergia con Prioritized Experience Replay, ritorni n-step e margin loss in stile DQfD.
 
-I risultati ottenuti confermano l'efficacia complessiva dell'approccio, pur lasciando margine di miglioramento legato alla variabilità del dataset. Il lavoro dimostra, più in generale, come l'integrazione mirata di più tecniche consolidate della letteratura RL (Dueling, Double DQN, PER, DQfD, reward shaping basato su CIoU) possa produrre una pipeline solida e addestrabile anche su dataset medicali di dimensioni contenute.
+I risultati ottenuti confermano l'efficacia complessiva dell'approccio, pur lasciando margine di miglioramento legato alla variabilità del dataset. Il lavoro dimostra, più in generale, come l'integrazione mirata di più tecniche consolidate della letteratura RL (Dueling [[5]](#ref5), Double DQN [[6]](#ref6), PER [[7]](#ref7), DQfD, reward shaping basato su CIoU) possa produrre una pipeline solida e addestrabile anche su dataset medicali di dimensioni contenute.
 
 ---
 
@@ -557,15 +557,15 @@ I risultati ottenuti confermano l'efficacia complessiva dell'approccio, pur lasc
 
 Applicazioni RL alla localizzazione/segmentazione medicale e visiva
 
-1. Stember, J.N., Shalu, H.. Reinforcement learning using Deep networks and learning accurately localizes brain tumors on MRI with very small training sets (2022). DOI 10.1186/s12880-022-00919-x, https://doi.org/10.1186/s12880-022-00919-x
-2. Ding, Yi and Qin, Xue and Zhang, Mingfeng and Geng, Ji and Chen, Dajiang and Deng, Fuhu and Song, Chunhe. RLSegNet: An Medical Image Segmentation Network Based on Reinforcement Learning (2023). DOI 10.1109/TCBB.2022.3195705, https://ieeexplore-ieee-org.unimib.idm.oclc.org/abstract/document/9847069
-3. Joseph Stember, Hrithwik Shalu. Deep reinforcement learning to detect brain lesions on MRI: a proof-of-concept application of reinforcement learning to medical images (2008). DOI 10.48550/arXiv.2008.02708, https://doi.org/10.48550/arXiv.2008.02708
-4. Juan C. Caicedo, Svetlana Lazebnik. Active Object Localization with Deep Reinforcement Learning (2015). DOI 10.48550/arXiv.1511.06015, https://doi.org/10.48550/arXiv.1511.06015
+<a id="ref1"></a>1. Stember, J.N., Shalu, H.. Reinforcement learning using Deep networks and learning accurately localizes brain tumors on MRI with very small training sets (2022). DOI 10.1186/s12880-022-00919-x, https://doi.org/10.1186/s12880-022-00919-x
+<a id="ref2"></a>2. Ding, Yi and Qin, Xue and Zhang, Mingfeng and Geng, Ji and Chen, Dajiang and Deng, Fuhu and Song, Chunhe. RLSegNet: An Medical Image Segmentation Network Based on Reinforcement Learning (2023). DOI 10.1109/TCBB.2022.3195705, https://ieeexplore-ieee-org.unimib.idm.oclc.org/abstract/document/9847069
+<a id="ref3"></a>3. Joseph Stember, Hrithwik Shalu. Deep reinforcement learning to detect brain lesions on MRI: a proof-of-concept application of reinforcement learning to medical images (2008). DOI 10.48550/arXiv.2008.02708, https://doi.org/10.48550/arXiv.2008.02708
+<a id="ref4"></a>4. Juan C. Caicedo, Svetlana Lazebnik. Active Object Localization with Deep Reinforcement Learning (2015). DOI 10.48550/arXiv.1511.06015, https://doi.org/10.48550/arXiv.1511.06015
 
 Metodologie utilizzate nell'agente
 
-5. Ziyu Wang, Tom Schaul, Matteo Hessel, Hado van Hasselt, Marc Lanctot, Nando de Freitas. Dueling Network Architectures for Deep Reinforcement Learning (2015). DOI 10.48550/arXiv.1511.06581, https://doi.org/10.48550/arXiv.1511.06581
-6. Hado van Hasselt, Arthur Guez, David Silver. Deep Reinforcement Learning with Double Q-learning (2015). DOI 10.48550/arXiv.1509.06461, https://doi.org/10.48550/arXiv.1509.06461
-7. Tom Schaul, John Quan, Ioannis Antonoglou, David Silver. Prioritized Experience Replay (2015). DOI 10.48550/arXiv.1511.05952, https://doi.org/10.48550/arXiv.1511.05952
+<a id="ref5"></a>5. Ziyu Wang, Tom Schaul, Matteo Hessel, Hado van Hasselt, Marc Lanctot, Nando de Freitas. Dueling Network Architectures for Deep Reinforcement Learning (2015). DOI 10.48550/arXiv.1511.06581, https://doi.org/10.48550/arXiv.1511.06581
+<a id="ref6"></a>6. Hado van Hasselt, Arthur Guez, David Silver. Deep Reinforcement Learning with Double Q-learning (2015). DOI 10.48550/arXiv.1509.06461, https://doi.org/10.48550/arXiv.1509.06461
+<a id="ref7"></a>7. Tom Schaul, John Quan, Ioannis Antonoglou, David Silver. Prioritized Experience Replay (2015). DOI 10.48550/arXiv.1511.05952, https://doi.org/10.48550/arXiv.1511.05952
 
 ---
