@@ -1382,22 +1382,8 @@ def train(args, device, train_ds, val_ds):
 
             if n_active > 0:
                 iou_active = ious[step_active_mask]
-                ciou_active = cious[step_active_mask]
-
-                writer.add_scalar("Train/Step/IoU_Mean", iou_active.mean().item(), global_step)
-                writer.add_scalar("Train/Step/IoU_Std", iou_active.std(unbiased=False).item(), global_step)
-                writer.add_scalar("Train/Step/IoU_Max", iou_active.max().item(), global_step)
-                writer.add_scalar("Train/Step/CIoU_Mean", ciou_active.mean().item(), global_step)
-                writer.add_scalar("Train/Step/CIoU_Std", ciou_active.std(unbiased=False).item(), global_step)
-                writer.add_scalar("Train/Step/CIoU_Max", ciou_active.max().item(), global_step)
-
-                writer.add_scalar("Train/Step/Epsilon", epsilon, global_step)
-                writer.add_scalar("Train/Step/Teacher_Prob", p_teacher, global_step)
-                writer.add_scalar("Train/Step/Reward_Std", reward_scaler.std().item(), global_step)
-
                 current_step_iou = iou_active.mean().item()
                 epoch_step_ious.append(current_step_iou)
-                writer.add_scalar("Train/Step_IoU", current_step_iou, global_step)
 
             last_iou_per_slot = torch.where(step_active_mask, ious.detach(), last_iou_per_slot)
             newly_done = step_active_mask & dones
