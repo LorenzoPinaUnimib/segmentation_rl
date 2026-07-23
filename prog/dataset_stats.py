@@ -109,8 +109,8 @@ def _analyze_sample_for_stats(image_t, mask_t):
         tumor_pixels = img_hwc[mask_bin.astype(bool)]  # (N, C)
         color_per_channel = tumor_pixels.mean(axis=0)
         out["color_mean_overall"] = float(tumor_pixels.mean())
-    for c in range(C):
-        out[f"color_mean_ch{c}"] = float(color_per_channel[c]) if C > 0 else np.nan
+    #for c in range(C):
+    #    out[f"color_mean_ch{c}"] = float(color_per_channel[c]) if C > 0 else np.nan
 
     # Centroide della GT (default: centro immagine, se manca la GT)
     centroid = (W / 2.0, H / 2.0)
@@ -523,7 +523,7 @@ def run_dataset_statistics(output_root, partitions):
         metric_cols_ref = all_keys  # riuso identico per tutte le partizioni
 
         # Determino dinamicamente le colonne colore per-canale presenti
-        color_channel_keys = sorted([k for k in summary.keys() if k.startswith("color_mean_ch")])
+        #color_channel_keys = sorted([k for k in summary.keys() if k.startswith("color_mean_ch")])
 
         print(f"[INFO] --- Statistiche partizione '{partition_name}' ---")
         _print_stats_group(
@@ -532,7 +532,7 @@ def run_dataset_statistics(output_root, partitions):
         )
         _print_stats_group(
             "Colore medio del tumore",
-            summary, ["color_mean_overall"] + color_channel_keys
+            summary, ["color_mean_overall"] #+ color_channel_keys
         )
         _print_stats_group(
             "Concavità e feature geometriche",
