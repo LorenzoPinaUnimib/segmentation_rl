@@ -149,32 +149,7 @@ La dimensione totale del vettore di coordinate / contesto è quindi di 11 valori
 
 Figura 2. Schema a blocchi della pipeline di osservazione:
 
-```mermaid
-flowchart TD
-    IMG["Immagine di input"] --> BB["ResNet18\n(backbone congelata)"]
-    BB --> GFM["Feature map globale dell'immagine"]
-
-    BOX["Box corrente\n+ margine di contesto"] --> ROI["RoI Align"]
-    GFM --> ROI
-    ROI --> RFM["Feature map della regione corrente"]
-
-    RFM --> POOL["Pooling spaziale"]
-    POOL --> EMB["Embedding visivo della regione"]
-
-    RFM --> SBF["Feature di bias spaziale\n(bilanciamento sinistra/destra e alto/basso,\nbaricentro e dispersione dell'attivazione)"]
-
-    ENV["Osservazione dell'ambiente"] --> BOXF["Coordinate della box normalizzate\n+ frazione di step trascorsi"]
-
-    HIST["Storia delle ultime azioni"] --> OH["Vettore one-hot concatenato"]
-
-    EMB --> CAT["Concatenazione"]
-    SBF --> XF["Feature extra\n(coordinate + bias spaziale)"]
-    BOXF --> XF
-    XF --> CAT
-    OH --> CAT
-
-    CAT --> QIN["Input alla testa decisionale"]
-```
+![Pipeline](Immagini/Pipeline.svg)
 
 ---
 
@@ -225,52 +200,7 @@ $$
 
 Figura 3. Diagramma dell'architettura completa:
 
-```mermaid
-flowchart TD
-    subgraph BACKBONE["Backbone — sempre congelata"]
-        RES["ResNet18\n(pooling globale e classificatore rimossi)"] --> FM["Feature map convoluzionale"]
-    end
-
-    FM --> SP{"Pooling spaziale"}
-
-    subgraph SAP["SpatialAttentionPool (se pretrainata)"]
-        REF["Raffinamento\n(convoluzione + BatchNorm + ReLU)"] --> ATT["Mappa di attenzione\n(convoluzione + softmax spaziale)"]
-        REF --> AVG["Media semplice\n(pooling classico)"]
-        ATT --> APOOL["Vettore pesato per attenzione"]
-        AVG --> AVGP["Vettore mediato"]
-        APOOL --> CC["Concatenazione"]
-        AVGP --> CC
-        CC --> PROJ["Proiezione lineare + ReLU"]
-    end
-
-    SP --> REF
-    SP --> AAP["Media semplice\n(pooling classico)"]
-
-    PROJ --> EMBED["Embedding visivo della regione"]
-    AAP --> EMBED
-
-    HIST2["Storia azioni\n(one-hot)"] --> CONCAT["Concatenazione"]
-    EMBED --> CONCAT
-    XFEAT["Feature extra\n(coordinate + bias spaziale)"] --> CONCAT
-
-    subgraph QNET["QNetwork — Dueling (testa allenabile)"]
-        CONCAT --> SHARED["Tronco condiviso\n(Linear + LayerNorm + ReLU)"]
-        SHARED --> VAL["Value stream\n→ V(s)"]
-        SHARED --> ADV["Advantage stream\n→ A(s,a)"]
-        VAL --> COMB["Q(s,a) = V(s) + (A(s,a) − media di A(s,a))"]
-        ADV --> COMB
-    end
-
-    COMB --> QOUT["Q-value\n(uno per azione discreta)"]
-
-    subgraph DOUBLE["Double DQN — solo in fase di update"]
-        POLNET["Rete di policy"] --> ASTAR["Azione scelta"]
-        ASTAR --> TARGETNET["Rete target"]
-        TARGETNET --> SOFT["Soft update"]
-    end
-
-    QOUT -.-> POLNET
-```
+![Architettura](Immagini/Architettura.svg)
 
 ---
 
