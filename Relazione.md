@@ -118,7 +118,7 @@ Le metriche considerate comprendono descrittori di area e forma (area_ratio, asp
 
 ![Train Metrics](Immagini/Train_Metrics.png)
 
-Sul training set area_ratio (frazione di immagine occupata dal tumore) ha una media del 29% con deviazione standard di 11%, indicando come i tumori occupino principalmente una porzione molto piccola dell'immagine.
+Sul training set area_ratio (frazione di immagine occupata dal tumore) ha una media del 2.9% con deviazione standard di 1.1%, indicando come i tumori occupino principalmente una porzione molto piccola dell'immagine.
 
 Aspect_ratio mostra una distribuzione fortemente asimmetrica con una coda lunga fino a valori superiori a 3, corrispondente a lesioni molto allungate. Similmente, circularity ed eccentricity confermano una popolazione eterogenea che spazia da forme quasi circolari a forme marcatamente irregolari o allungate.
 
@@ -499,16 +499,26 @@ I risultati finali ottenuti sul test set (mai visto prima dal modello) conferman
 
 Su 215 immagini l'agente ha ottenuto una IoU media del 55% e ha terminato volontariamente l'episodio in 205 casi (≈95,3%). Considerando solo gli episodi terminati volontariamente la IoU media finale è pari ad un 58%.
 
+![Instogramma iou](Immagini/istogramma_final_iou.png)
+
 Il success rate (la frazione di episodi terminati con una IoU finale superiore alla soglia di successo $\tau_{IoU}$ = 0,6) è pari a 51%: poco più della metà delle localizzazioni terminate raggiunge quindi una sovrapposizione giudicata soddisfacente.
 
-![Test 29 fine](Immagini/Test%2029%20fine.png)
-![Test 47 fine](Immagini/Test%2047%20fine.png)
+<br>
+<div style="display: flex; justify-content: center; align-items: center; gap: 20px;">
+  <img src="Immagini/Test%2029%20fine.png" style="max-width: 45%; height: auto;">
+  <img src="Immagini/Test%2047%20fine.png" style="max-width: 45%; height: auto;">
+</div>
+<br>
+
 
 Andando ad analizzare alcuni esempi in cui l’agente non termina e ottiene un valore di IoU pari a 0 emerge che il tumore risulta difficoltoso da discriminare anche a livello visivo. In particolare, nei casi osservati, la struttura tumorale presenta caratteristiche tali da confondersi con il contesto dell’immagine rendendo più complessa la localizzazione precisa.
 
-![Test 21 inizio](Immagini/Test%2021%20inizio.png)
-![Test 21 fine](Immagini/Test%2021%20fine.png)
-
+<br>
+<div style="display: flex; justify-content: center; align-items: center; gap: 20px;">
+  <img src="Immagini/Test%2021%20inizio.png" style="max-width: 45%; height: auto;">
+  <img src="Immagini/Test%2021%20fine.png" style="max-width: 45%; height: auto;">
+</div>
+<br>
 Inoltre, è presente un caso in cui l’agente termina l’esplorazione ma ottiene IoU pari a 0: la presenza di un’area con aspetto simile a quello del tumore induce una localizzazione errata durante l’esecuzione, nonostante una prima individuazione corretta della zona tumorale.
 
 ---
